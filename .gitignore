@@ -12,8 +12,8 @@ manifest.sig
 tiles-manifest.key
 tiles-manifest.priv
 
-# Bundle cache files.
-cache/
+# Bundle cache files (anchored to repo root so it never matches internal/cache/).
+/cache/
 *.scb1gz
 
 # Local environment files and rendered Helm secrets.
