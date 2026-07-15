@@ -1,0 +1,49 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "scms.fullname" . }}
+  labels:
+    {{- include "scms.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "scms.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Public/ingress traffic to the API port only.
+    - ports:
+        - port: http
+          protocol: TCP
+      {{- if .Values.networkPolicy.ingressNamespaceSelector }}
+      from:
+        - namespaceSelector:
+            {{- toYaml .Values.networkPolicy.ingressNamespaceSelector | nindent 12 }}
+      {{- end }}
+    # Monitoring namespace may scrape /metrics on the same API port.
+    {{- with .Values.networkPolicy.monitoringNamespaceSelector }}
+    - ports:
+        - port: http
+          protocol: TCP
+      from:
+        - namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+    {{- end }}
+  egress:
+    # DNS.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # HTTPS to the artifact host (manifest + PMTiles) and the Kubernetes API.
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+# Martin (127.0.0.1:3000) is pod-local loopback and needs no NetworkPolicy rule;
+# it is never reachable off-pod.
+{{- end }}

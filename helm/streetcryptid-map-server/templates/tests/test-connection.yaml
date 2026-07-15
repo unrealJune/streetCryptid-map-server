@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "scms.fullname" . }}-test
+  labels:
+    {{- include "scms.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  securityContext:
+    {{- toYaml .Values.podSecurityContext | nindent 4 }}
+  containers:
+    - name: probe
+      image: "{{ .Values.tests.image.repository }}:{{ .Values.tests.image.tag }}"
+      command: ["/bin/sh", "-c"]
+      # Confirm the Service resolves and the API answers liveness + readiness.
+      args:
+        - >
+          curl -fsS http://{{ include "scms.fullname" . }}:{{ .Values.service.port }}/livez
+          && curl -fsS http://{{ include "scms.fullname" . }}:{{ .Values.service.port }}/readyz
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}

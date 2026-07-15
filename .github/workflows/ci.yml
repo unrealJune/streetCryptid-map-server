@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: gofmt check
+        run: |
+          fmtout="$(gofmt -l .)"
+          if [ -n "$fmtout" ]; then
+            echo "These files are not gofmt-clean:"; echo "$fmtout"; exit 1
+          fi
+      - name: go test -race
+        run: go test -race ./...
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+      - name: helm lint
+        run: |
+          helm lint helm/streetcryptid-map-server \
+            --set tiles.manifestURL=https://artifacts.example.com/manifest.json \
+            --set tiles.publicKey=0123456789abcdef
+      - name: helm template + assert no Martin exposure
+        run: |
+          helm template rel helm/streetcryptid-map-server \
+            --set tiles.manifestURL=https://artifacts.example.com/manifest.json \
+            --set tiles.publicKey=0123456789abcdef \
+            --set ingress.enabled=true --show-only templates/service.yaml \
+            --show-only templates/ingress.yaml > /tmp/svc.yaml
+          if grep -E '^\s*(port|number):\s*3000' /tmp/svc.yaml; then
+            echo "Martin port 3000 leaked into a Service/Ingress"; exit 1
+          fi
+          echo "OK: Martin 3000 not exposed"
+      - name: reject privacy-weakening value
+        run: |
+          if helm template rel helm/streetcryptid-map-server \
+            --set tiles.manifestURL=https://artifacts.example.com/manifest.json \
+            --set tiles.publicKey=0123456789abcdef \
+            --set disablePrivacy=true >/dev/null 2>&1; then
+            echo "schema accepted disablePrivacy"; exit 1
+          fi
+          echo "OK: disablePrivacy rejected by schema"

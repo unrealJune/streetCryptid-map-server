@@ -1,0 +1,16 @@
+{{- if .Values.tiles.autoUpdate.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "scms.fullname" . }}-updater
+  labels:
+    {{- include "scms.labels" . | nindent 4 }}
+rules:
+  # The updater may get and patch ONLY this Deployment, by name. It has no other
+  # verbs and no cluster-wide write access, so it cannot patch other Deployments.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames:
+      - {{ include "scms.fullname" . | quote }}
+    verbs: ["get", "patch"]
+{{- end }}

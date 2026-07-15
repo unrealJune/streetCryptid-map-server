@@ -1,0 +1,12 @@
+{{- if .Values.tiles.publicKey }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "scms.fullname" . }}-manifest-key
+  labels:
+    {{- include "scms.labels" . | nindent 4 }}
+data:
+  # Ed25519 verification public key for the signed tile manifest (64 hex chars).
+  # The private signing key never enters the cluster.
+  tiles-manifest.pub: {{ .Values.tiles.publicKey | quote }}
+{{- end }}

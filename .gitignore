@@ -1,0 +1,35 @@
+# Map data must never enter source control (60-100 GB) — bootstrap fetches it.
+data/*
+!data/.gitkeep
+*.pmtiles
+*.part
+manifest.json
+manifest.sig
+
+# Signed-manifest signing key must never be committed. The public key is
+# mounted through Helm from a Secret/ConfigMap, not stored here.
+*.pem
+tiles-manifest.key
+tiles-manifest.priv
+
+# Bundle cache files.
+cache/
+*.scb1gz
+
+# Local environment files and rendered Helm secrets.
+*.env
+.env*
+helm/**/rendered/
+helm/**/*-secret.yaml
+
+# Build output, logs, profiling.
+/streetcryptid-map-server
+/out/
+*.log
+*.prof
+*.test
+
+# Editor / OS.
+.vscode/
+.idea/
+.DS_Store

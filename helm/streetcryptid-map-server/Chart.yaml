@@ -1,0 +1,22 @@
+apiVersion: v2
+name: streetcryptid-map-server
+description: >-
+  Privacy-quantized OpenMapTiles map API. A custom Go server owns the only public
+  endpoint (coarse XYZ z0-10 + fixed-z10 SCB1 bundles for z11-14); Martin runs as
+  a private localhost-only sidecar. Tile data self-bootstraps from a signed
+  artifact manifest and updates by recreating the pod.
+type: application
+version: 0.1.0
+# appVersion tracks the Go server image tag.
+appVersion: "0.1.0"
+keywords:
+  - openmaptiles
+  - martin
+  - pmtiles
+  - map
+  - privacy
+home: https://github.com/unrealJune/streetCryptid-map-server
+sources:
+  - https://github.com/unrealJune/streetCryptid-map-server
+maintainers:
+  - name: june

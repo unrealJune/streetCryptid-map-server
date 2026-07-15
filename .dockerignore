@@ -1,0 +1,31 @@
+# Keep the build context minimal and secret-free.
+.git
+.gitignore
+*.md
+!go.mod
+!go.sum
+
+# Never ship map data or caches into the image.
+data/
+*.pmtiles
+*.part
+manifest.json
+manifest.sig
+cache/
+*.scb1gz
+
+# Deployment + tooling not needed by the Go build.
+helm/
+scripts/
+
+# Local env / secrets / keys.
+*.env
+.env*
+*.pem
+*.key
+tiles-manifest.*
+
+# Editor / OS noise.
+.vscode/
+.idea/
+*.log

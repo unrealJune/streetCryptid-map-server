@@ -1,0 +1,21 @@
+{{- if not .Values.persistence.tiles.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "scms.tilesClaimName" . }}
+  labels:
+    {{- include "scms.labels" . | nindent 4 }}
+  annotations:
+    # Keep the tile data across chart upgrades/uninstalls; re-downloading the
+    # planet is expensive.
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.tiles.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.tiles.size }}
+  {{- if .Values.persistence.tiles.storageClass }}
+  storageClassName: {{ .Values.persistence.tiles.storageClass | quote }}
+  {{- end }}
+{{- end }}

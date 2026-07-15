@@ -1,0 +1,188 @@
+# Default values for streetcryptid-map-server.
+#
+# NOTE: There is deliberately no value that can weaken the privacy boundary. The
+# z0-10 raw cutoff and fixed-z10 bundle anchor are compiled into the API image.
+# values.schema.json rejects any attempt to add a privacy-weakening key.
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Single replica by default: the bundle cache is node-local (emptyDir) and the
+# tiles PVC is ReadWriteOnce. Do not scale up until cross-replica cache
+# coordination is proven.
+replicaCount: 1
+
+# Recreate so old and new Martin never serve different datasets concurrently and
+# ReadWriteOnce volumes stay safe across a data update.
+strategy:
+  type: Recreate
+
+image:
+  # The custom Go API image built from this repository's Dockerfile (GHCR).
+  repository: ghcr.io/unrealjune/streetcryptid-map-server
+  tag: ""          # defaults to .Chart.AppVersion
+  digest: ""       # if set, pinned by digest and overrides tag
+  pullPolicy: IfNotPresent
+
+martin:
+  # Upstream Martin, pinned. No Service/Ingress is ever created for it.
+  image:
+    repository: ghcr.io/maplibre/martin
+    tag: "v0.17.0"
+    pullPolicy: IfNotPresent
+  port: 3000
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# --- API container ----------------------------------------------------------
+api:
+  port: 8080
+  # Operational runtime configuration only (no privacy constants).
+  bundleWorkers: 16
+  bundleRequestTimeout: 60s
+  bundleMaxBytes: 67108864     # 64 MiB decompressed cap
+  httpReadTimeout: 15s
+  httpWriteTimeout: 90s
+  httpIdleTimeout: 60s
+  rateLimitPerSec: 20
+  rateLimitBurst: 120
+  cache:
+    # Directory the API writes completed gzipped bundles to.
+    dir: /cache
+    maxBytes: 536870912         # 512 MiB
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+
+# --- Tile data: bootstrap + updater -----------------------------------------
+tiles:
+  dataDir: /data
+  # HTTPS URL of the signed manifest.json (manifest.sig is fetched alongside).
+  manifestURL: ""
+  # Ed25519 verification public key (hex or raw). Mounted via a ConfigMap.
+  # REQUIRED whenever autoUpdate is enabled or the volume must bootstrap.
+  publicKey: ""
+  retainReleases: 2
+  # Optional bearer credentials for a private artifact host. Provided ONLY via an
+  # existing Secret; never inline in Helm values.
+  authSecret:
+    name: ""
+    key: token
+  autoUpdate:
+    enabled: true
+    interval: 6h
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        cpu: 250m
+        memory: 128Mi
+  bootstrap:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+
+# --- Storage ----------------------------------------------------------------
+persistence:
+  tiles:
+    existingClaim: ""
+    accessModes:
+      - ReadWriteOnce
+    storageClass: ""
+    # Sized for at least two full releases plus one resumable staging file.
+    size: 250Gi
+  cache:
+    # emptyDir by default; set existingClaim to use a PVC.
+    existingClaim: ""
+    sizeLimit: 1Gi
+
+# --- Service ----------------------------------------------------------------
+service:
+  # Only API port 8080 is ever exposed. Martin 3000 is never in a Service.
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+  # For clusters without an Ingress controller:
+  loadBalancerIP: ""
+
+# --- Ingress ----------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: martin.junephilip.com
+  path: /
+  pathType: Prefix
+  tls:
+    enabled: false
+    secretName: ""
+
+# --- NetworkPolicy ----------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Namespaces allowed to scrape /metrics.
+  monitoringNamespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: monitoring
+  # Extra ingress rules if a specific ingress-controller namespace must reach 8080.
+  ingressNamespaceSelector: {}
+
+# --- PodDisruptionBudget ----------------------------------------------------
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# --- ServiceMonitor (Prometheus Operator) -----------------------------------
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+
+# --- Pod security -----------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+
+# Image used by the `helm test` connection pod.
+tests:
+  image:
+    repository: curlimages/curl
+    tag: "8.11.1"
