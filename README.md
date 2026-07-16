@@ -71,6 +71,31 @@ metadata. A failed download/signature/hash leaves the active release untouched;
 at least two releases are retained for rollback. The signing private key never
 enters the cluster.
 
+### In-cluster bake (no external download)
+
+If you'd rather **produce** the planet on the cluster than host it externally,
+enable `tiles.bake` (with `tiles.autoUpdate.enabled=false`). A **heavily
+throttled** CronJob runs Planetiler onto a dedicated scratch volume, then
+`tiles import` installs the result as the active release — no network fetch and
+no signature (an in-cluster-baked file is trusted; the download path still
+requires a signature).
+
+The bake is boxed in so it can't starve the cluster: pinned to one node,
+CPU/memory limited, Planetiler `--threads`/`-Xmx` bounded, the low-memory mmap
+profile (nodemap spills to SSD), a capped OSM download bandwidth, and a
+suspended-by-default schedule. A planet bake still wants ~64 GB RAM, ~500 GB
+scratch, and ~a day — pin the serving Deployment to the same node so it shares
+the ReadWriteOnce tile volume.
+
+```bash
+helm upgrade --install maps helm/streetcryptid-map-server \
+  --set tiles.autoUpdate.enabled=false \
+  --set tiles.bake.enabled=true \
+  --set nodeSelector."kubernetes\.io/hostname"=delphinium
+# trigger the bake on demand:
+kubectl create job maps-bake-now --from=cronjob/maps-streetcryptid-map-server-bake
+```
+
 ## The binary
 
 One static, non-root, distroless image; four subcommands:

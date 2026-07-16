@@ -59,8 +59,10 @@ func (m *Manifest) validate() error {
 	if m.Version == "" {
 		return errors.New("manifest: empty version")
 	}
-	if !isHTTPS(m.URL) {
-		return errors.New("manifest: url must be https")
+	// Remote releases must be https. Locally-baked releases (in-cluster bake
+	// mode) carry a `local:` URL and are never fetched over the network.
+	if !isHTTPS(m.URL) && !isLocal(m.URL) {
+		return errors.New("manifest: url must be https or local:")
 	}
 	if len(m.SHA256) != 64 || !isHex(m.SHA256) {
 		return errors.New("manifest: sha256 must be 64 hex chars")
@@ -96,6 +98,14 @@ func VerifySignature(pub ed25519.PublicKey, manifestBytes, sig []byte) error {
 func isHTTPS(u string) bool {
 	return len(u) > 8 && u[:8] == "https://"
 }
+
+// isLocal marks a release produced by an in-cluster bake rather than fetched.
+func isLocal(u string) bool {
+	return len(u) >= 6 && u[:6] == "local:"
+}
+
+// IsLocal reports whether a manifest describes a locally-baked release.
+func (m *Manifest) IsLocal() bool { return isLocal(m.URL) }
 
 func isHex(s string) bool {
 	for _, c := range s {

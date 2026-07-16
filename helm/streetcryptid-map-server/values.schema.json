@@ -71,6 +71,29 @@
             "enabled": { "type": "boolean" },
             "interval": { "type": "string" }
           }
+        },
+        "bake": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "area": { "type": "string", "minLength": 1 },
+            "minZoom": { "type": "integer", "minimum": 0, "maximum": 24 },
+            "maxZoom": { "type": "integer", "minimum": 0, "maximum": 24 },
+            "suspend": { "type": "boolean" },
+            "schedule": { "type": "string" },
+            "nodeName": { "type": "string" },
+            "threads": { "type": "integer", "minimum": 1 },
+            "xmx": { "type": "string" },
+            "downloadMaxBandwidth": { "type": "string" },
+            "lowMemory": { "type": "boolean" },
+            "scratch": {
+              "type": "object",
+              "properties": {
+                "size": { "type": "string" },
+                "storageClass": { "type": "string" }
+              }
+            }
+          }
         }
       },
       "allOf": [

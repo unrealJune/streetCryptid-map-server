@@ -123,11 +123,13 @@ func (s *Store) ValidateRelease(safe string) (*Manifest, error) {
 	if err != nil {
 		return nil, err
 	}
-	sig, err := os.ReadFile(filepath.Join(dir, sigName))
-	if err != nil {
-		return nil, err
-	}
+	// A signature is required only when a verification key is configured. Locally
+	// baked releases (bake mode, no pub key) are unsigned and carry no sig file.
 	if s.pub != nil {
+		sig, err := os.ReadFile(filepath.Join(dir, sigName))
+		if err != nil {
+			return nil, err
+		}
 		if err := VerifySignature(s.pub, mb, sig); err != nil {
 			return nil, err
 		}

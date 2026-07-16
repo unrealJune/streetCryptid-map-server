@@ -186,6 +186,37 @@ func runTiles(log *slog.Logger, args []string) error {
 		fmt.Printf("active release OK: version=%s zoom=%d-%d schema=%s\n", m.Version, m.MinZoom, m.MaxZoom, m.TileSchema)
 		return nil
 
+	case "import":
+		// tiles import <pmtiles-path> [version]  — install a locally-baked file
+		// as the active release (in-cluster bake mode). Optionally triggers a pod
+		// recreate when POD_NAMESPACE/DEPLOYMENT_NAME are set.
+		if len(args) < 2 {
+			return errors.New("usage: tiles import <pmtiles-path> [version]")
+		}
+		path := args[1]
+		importVersion := ""
+		if len(args) >= 3 {
+			importVersion = args[2]
+		}
+		var kube *tilesync.KubeClient
+		if cfg.DeploymentName != "" {
+			if k, err := tilesync.InClusterKubeClient(); err == nil {
+				kube = k
+				if cfg.Namespace == "" {
+					cfg.Namespace = k.Namespace()
+				}
+			} else {
+				log.Warn("import: no in-cluster client; will not trigger pod recreate", "err", err.Error())
+			}
+		}
+		s := tilesync.NewSyncer(cfg, kube)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		if _, err := s.ImportLocal(ctx, path, importVersion); err != nil {
+			return fmt.Errorf("import: %w", err)
+		}
+		return nil
+
 	default:
 		return fmt.Errorf("unknown tiles subcommand %q", args[0])
 	}

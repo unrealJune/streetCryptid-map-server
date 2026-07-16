@@ -103,6 +103,64 @@ tiles:
         cpu: "1"
         memory: 512Mi
 
+  # --- In-cluster planet bake (option C) ------------------------------------
+  # Produces planet.pmtiles ON the cluster instead of downloading it, then
+  # `tiles import` installs it as the active release. HEAVILY THROTTLED so it
+  # cannot starve the rest of the homelab. Disabled by default; when enabled,
+  # keep autoUpdate off (the bake is the update mechanism) and DO NOT set a
+  # manifestURL/publicKey — locally baked releases are unsigned and trusted.
+  #
+  # A planet bake wants ~64 GB RAM, ~500 GB scratch, ~a day. Pin the serving
+  # Deployment to the SAME node (top-level nodeSelector) so it can share the
+  # ReadWriteOnce tile volume with the bake pod.
+  bake:
+    enabled: false
+    # onthegomap/planetiler, pinned. Runs as the bake init container.
+    image:
+      repository: ghcr.io/onthegomap/planetiler
+      tag: "0.9.0"
+      pullPolicy: IfNotPresent
+    # Planetiler --area (planet, or a region extract name / .osm.pbf URL).
+    area: planet
+    minZoom: 0
+    maxZoom: 14
+    # Suspended CronJob by default: trigger on demand with
+    #   kubectl create job planet-bake-now --from=cronjob/<release>-bake
+    # or set suspend=false to run on the schedule.
+    suspend: true
+    schedule: "0 3 * * 0"   # weekly, Sunday 03:00 (only runs if suspend=false)
+    # Pin to a node that actually has the RAM + disk. delphinium: 12CPU/64GB/2.2TB.
+    nodeName: delphinium
+    # --- throttles (so the bake does not explode the cluster) ---
+    threads: 6                       # Planetiler worker threads (<= cpu limit)
+    xmx: "28g"                       # JVM heap; stays well under the memory limit
+    downloadMaxBandwidth: "50mb/s"   # cap the ~80 GB OSM source download
+    # Low-memory profile: spill the nodemap to the scratch SSD instead of RAM.
+    lowMemory: true
+    extraArgs: []
+    # Yield to real workloads; set to an existing low PriorityClass name.
+    priorityClassName: ""
+    resources:
+      requests:
+        cpu: "2"
+        memory: 8Gi
+      limits:
+        cpu: "6"
+        memory: 48Gi
+    # Dedicated scratch volume for OSM source + temp + nodemap. Single-replica
+    # (longhorn-local) so a huge transient volume is not replicated 2-3x.
+    scratch:
+      size: 700Gi
+      storageClass: longhorn-local
+    # Resources for the small `tiles import` step that installs the result.
+    importResources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
 # --- Storage ----------------------------------------------------------------
 persistence:
   tiles:

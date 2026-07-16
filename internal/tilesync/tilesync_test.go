@@ -277,6 +277,49 @@ func TestPruneRetainsReleases(t *testing.T) {
 	}
 }
 
+func TestImportLocalRelease(t *testing.T) {
+	// Bake mode: no manifest URL, no public key. A baked file on the volume is
+	// imported and activated with no network or signature.
+	s := NewSyncer(Config{DataDir: t.TempDir(), RetainReleases: 2}, nil)
+	s.st.EnsureLayout()
+
+	// Simulate the bake writing output onto the tile volume's staging dir.
+	baked := filepath.Join(s.st.stagingPath(), "planet.pmtiles")
+	os.WriteFile(baked, synthPMTiles(0, 14), 0o644)
+
+	m, err := s.ImportLocal(context.Background(), baked, "planet-2026-07-15")
+	if err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	if !m.IsLocal() {
+		t.Fatalf("imported manifest should be local, url=%s", m.URL)
+	}
+	active, err := s.Store().ReadActive()
+	if err != nil {
+		t.Fatalf("read active: %v", err)
+	}
+	if active.Version != "planet-2026-07-15" || active.MaxZoom != 14 {
+		t.Fatalf("unexpected active release: %+v", active)
+	}
+	// The staged file was moved into the release dir.
+	if _, err := os.Stat(baked); !os.IsNotExist(err) {
+		t.Fatal("baked file should have been moved into the release")
+	}
+	if _, err := os.Stat(s.st.PMTilesPathFor(safeVersion("planet-2026-07-15"))); err != nil {
+		t.Fatalf("release pmtiles missing: %v", err)
+	}
+}
+
+func TestImportRejectsNonPMTiles(t *testing.T) {
+	s := NewSyncer(Config{DataDir: t.TempDir(), RetainReleases: 2}, nil)
+	s.st.EnsureLayout()
+	bad := filepath.Join(t.TempDir(), "bad.pmtiles")
+	os.WriteFile(bad, []byte("not a pmtiles file"), 0o644)
+	if _, err := s.ImportLocal(context.Background(), bad, "v1"); err == nil {
+		t.Fatal("import should reject a non-PMTiles file")
+	}
+}
+
 func TestUpdateStagesAndPatches(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	as := newArtifactServer(t, priv, "v-1", 0, 14)

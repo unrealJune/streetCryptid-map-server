@@ -1,0 +1,117 @@
+{{- if .Values.tiles.bake.enabled }}
+{{- $b := .Values.tiles.bake }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "scms.fullname" . }}-bake
+  labels:
+    {{- include "scms.labels" . | nindent 4 }}
+spec:
+  # Suspended by default: trigger manually with
+  #   kubectl create job {{ include "scms.fullname" . }}-bake-now \
+  #     --from=cronjob/{{ include "scms.fullname" . }}-bake
+  suspend: {{ $b.suspend }}
+  schedule: {{ $b.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      # A planet bake can run most of a day; allow up to 36h before giving up.
+      activeDeadlineSeconds: 129600
+      template:
+        metadata:
+          labels:
+            {{- include "scms.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: bake
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "scms.serviceAccountName" . }}
+          # Pin to a node with the RAM + disk. The serving Deployment should be
+          # pinned to the same node so it can share the RWO tile volume.
+          nodeSelector:
+            kubernetes.io/hostname: {{ $b.nodeName | quote }}
+          {{- with $b.priorityClassName }}
+          priorityClassName: {{ . }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          # --- Heavy, throttled bake runs as an init container ---------------
+          initContainers:
+            - name: planetiler
+              image: "{{ $b.image.repository }}:{{ $b.image.tag }}"
+              imagePullPolicy: {{ $b.image.pullPolicy }}
+              env:
+                # Cap the JVM heap well under the memory limit; the rest is
+                # reclaimable mmap page cache for the spilled nodemap.
+                - name: JAVA_TOOL_OPTIONS
+                  value: "-Xmx{{ $b.xmx }}"
+              args:
+                - "--download"
+                - "--area={{ $b.area }}"
+                - "--minzoom={{ $b.minZoom }}"
+                - "--maxzoom={{ $b.maxZoom }}"
+                - "--threads={{ $b.threads }}"
+                - "--download-max-bandwidth={{ $b.downloadMaxBandwidth }}"
+                - "--tmpdir=/scratch/tmp"
+                - "--download-dir=/scratch/sources"
+                {{- if $b.lowMemory }}
+                # Spill the nodemap to the scratch SSD instead of holding it all
+                # in RAM — the "planet on <64 GB" recipe.
+                - "--storage=mmap"
+                - "--nodemap-type=sortandmerge"
+                - "--nodemap-storage=mmap"
+                {{- end }}
+                {{- range $b.extraArgs }}
+                - {{ . | quote }}
+                {{- end }}
+                # Write to fast local scratch (keeps the heavy writer off the
+                # replicated tile volume); `tiles import` moves it across after.
+                - "--force"
+                - "--output=/scratch/planet.pmtiles"
+              volumeMounts:
+                - name: tiles
+                  mountPath: {{ .Values.tiles.dataDir }}
+                - name: scratch
+                  mountPath: /scratch
+              resources:
+                {{- toYaml $b.resources | nindent 16 }}
+          # --- Small import step installs + activates the baked release -------
+          containers:
+            - name: import
+              image: {{ include "scms.apiImage" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - "tiles"
+                - "import"
+                - "/scratch/planet.pmtiles"
+              env:
+                - name: TILE_DATA_DIR
+                  value: {{ .Values.tiles.dataDir | quote }}
+                - name: TILE_RETAIN_RELEASES
+                  value: {{ .Values.tiles.retainReleases | quote }}
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                # Set so the import triggers a pod recreate to pick up the dataset.
+                - name: DEPLOYMENT_NAME
+                  value: {{ include "scms.fullname" . | quote }}
+              volumeMounts:
+                - name: tiles
+                  mountPath: {{ .Values.tiles.dataDir }}
+                - name: scratch
+                  mountPath: /scratch
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              resources:
+                {{- toYaml $b.importResources | nindent 16 }}
+          volumes:
+            - name: tiles
+              persistentVolumeClaim:
+                claimName: {{ include "scms.tilesClaimName" . }}
+            - name: scratch
+              persistentVolumeClaim:
+                claimName: {{ include "scms.fullname" . }}-bake-scratch
+{{- end }}

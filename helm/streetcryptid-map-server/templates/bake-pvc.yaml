@@ -1,0 +1,23 @@
+{{- if .Values.tiles.bake.enabled }}
+# Scratch volume for the in-cluster planet bake: OSM source download, Planetiler
+# temp files, and the spilled nodemap. Single-replica by design — this is huge
+# and transient, not worth replicating. Kept across runs so an interrupted bake
+# can reuse the downloaded source.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "scms.fullname" . }}-bake-scratch
+  labels:
+    {{- include "scms.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.tiles.bake.scratch.size }}
+  {{- if .Values.tiles.bake.scratch.storageClass }}
+  storageClassName: {{ .Values.tiles.bake.scratch.storageClass | quote }}
+  {{- end }}
+{{- end }}
