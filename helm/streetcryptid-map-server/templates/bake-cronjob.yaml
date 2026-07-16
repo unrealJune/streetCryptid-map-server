@@ -60,7 +60,7 @@ spec:
                 # Spill the nodemap to the scratch SSD instead of holding it all
                 # in RAM — the "planet on <64 GB" recipe.
                 - "--storage=mmap"
-                - "--nodemap-type=sortandmerge"
+                - "--nodemap-type=sparsearray"
                 - "--nodemap-storage=mmap"
                 {{- end }}
                 {{- range $b.extraArgs }}
