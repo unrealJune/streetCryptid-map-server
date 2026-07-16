@@ -249,6 +249,7 @@ func loadTileConfig(log *slog.Logger) (tilesync.Config, error) {
 		RetainReleases: int(envInt64("TILE_RETAIN_RELEASES", 2)),
 		Namespace:      os.Getenv("POD_NAMESPACE"),
 		DeploymentName: os.Getenv("DEPLOYMENT_NAME"),
+		AllowEmpty:     os.Getenv("TILE_ALLOW_EMPTY") == "true",
 		Logger:         log,
 	}, nil
 }

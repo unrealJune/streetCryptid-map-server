@@ -25,6 +25,10 @@ type Config struct {
 	DeploymentName string
 	Logger         *slog.Logger
 	HTTPClient     *http.Client
+	// AllowEmpty lets bootstrap succeed with no dataset yet (in-cluster bake
+	// mode, before the first bake). The pod starts but stays not-Ready until a
+	// bake produces data and triggers a recreate.
+	AllowEmpty bool
 }
 
 // Syncer performs bootstrap and update operations against the tile volume.
@@ -100,6 +104,14 @@ func (s *Syncer) Bootstrap(ctx context.Context) error {
 	}
 
 	// 3. No valid active release: we MUST obtain one from the remote manifest.
+	// In-cluster bake mode: no remote manifest, and the first bake hasn't run
+	// yet. Start the pod anyway (it stays not-Ready until the bake produces data
+	// and triggers a recreate) so the release reconciles instead of stalling.
+	if s.cfg.ManifestURL == "" && s.cfg.AllowEmpty {
+		s.log.Warn("no dataset yet and bake mode is on; starting not-ready until a bake completes")
+		return nil
+	}
+
 	s.log.Info("no valid active release; fetching from manifest")
 	m, mb, sig, err := s.fetchVerifiedManifest(ctx)
 	if err != nil {

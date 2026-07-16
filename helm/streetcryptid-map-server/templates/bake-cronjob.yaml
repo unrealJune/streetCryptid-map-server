@@ -75,6 +75,12 @@ spec:
                   mountPath: {{ .Values.tiles.dataDir }}
                 - name: scratch
                   mountPath: /scratch
+              # Satisfies restricted PSA. Root FS stays writable (JVM temp);
+              # runAsNonRoot + seccomp come from the pod securityContext.
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
               resources:
                 {{- toYaml $b.resources | nindent 16 }}
           # --- Small import step installs + activates the baked release -------

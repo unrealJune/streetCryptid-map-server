@@ -82,6 +82,10 @@ http://127.0.0.1:{{ .Values.martin.port }}/{{ include "scms.martinSource" . }}
   value: {{ .Values.tiles.autoUpdate.interval | quote }}
 - name: TILE_RETAIN_RELEASES
   value: {{ .Values.tiles.retainReleases | quote }}
+{{- if .Values.tiles.bake.enabled }}
+- name: TILE_ALLOW_EMPTY
+  value: "true"
+{{- end }}
 {{- end -}}
 
 {{/* Name of the tiles data PVC (chart-created or existing). */}}
