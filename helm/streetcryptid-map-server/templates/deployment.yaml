@@ -147,24 +147,22 @@ spec:
             - "{{ .Values.tiles.dataDir }}/current/planet.pmtiles"
           # No ports are declared: Martin is reached only over pod localhost and
           # must never be exposed by a Service, Ingress, hostPort or LoadBalancer.
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: {{ .Values.martin.port }}
-              host: 127.0.0.1
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: {{ .Values.martin.port }}
-              host: 127.0.0.1
-            initialDelaySeconds: 10
-            periodSeconds: 30
-            timeoutSeconds: 5
-            failureThreshold: 3
+          #
+          # No httpGet/tcpSocket probe here on purpose. Martin binds ONLY the pod
+          # loopback (127.0.0.1:{{ .Values.martin.port }}). The kubelet runs HTTP/TCP probes from
+          # the node's network namespace against the pod IP (or the literal `host`
+          # field), so it cannot reach a loopback-only listener: the pod IP has
+          # nothing on 3000, and `host: 127.0.0.1` resolves to the *node's*
+          # loopback. Such a probe never succeeds, so the container never goes
+          # Ready, the pod's EndpointSlice stays empty, and Traefik drops the
+          # route entirely (edge returns 404 for every path) — the exact failure
+          # this replaces.
+          #
+          # Pod readiness is instead gated by the map-api container's /readyz,
+          # which validates Martin's /catalog over localhost from INSIDE the pod
+          # (reachable, and it confirms the "planet" source is actually served).
+          # An exec probe is not used because the upstream Martin image ships no
+          # HTTP client (curl/wget) to call /health with.
           volumeMounts:
             - name: tiles
               mountPath: {{ .Values.tiles.dataDir }}
