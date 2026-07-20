@@ -147,24 +147,16 @@ spec:
             - "{{ .Values.tiles.dataDir }}/current/planet.pmtiles"
           # No ports are declared: Martin is reached only over pod localhost and
           # must never be exposed by a Service, Ingress, hostPort or LoadBalancer.
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: {{ .Values.martin.port }}
-              host: 127.0.0.1
-            initialDelaySeconds: 5
-            periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 3
-          livenessProbe:
-            httpGet:
-              path: /health
-              port: {{ .Values.martin.port }}
-              host: 127.0.0.1
-            initialDelaySeconds: 10
-            periodSeconds: 30
-            timeoutSeconds: 5
-            failureThreshold: 3
+          #
+          # Martin has NO kubelet probes on purpose. It binds 127.0.0.1:3000 only,
+          # but kubelet runs httpGet/tcp probes from the node's network namespace,
+          # so it can never reach a pod-loopback-only listener: `host: 127.0.0.1`
+          # dials the node's own loopback (503/refused) and omitting host dials
+          # podIP:3000 (nothing bound there). Either way the liveness probe fails
+          # and kubelet kills a perfectly healthy Martin every ~90s -> CrashLoop,
+          # which drags map-api /readyz (it checks Martin's catalog) down with it.
+          # Martin's health is instead gated by map-api's /readyz over pod-local
+          # 127.0.0.1 -> that container's readiness is what governs the Service.
           volumeMounts:
             - name: tiles
               mountPath: {{ .Values.tiles.dataDir }}
