@@ -52,6 +52,9 @@ spec:
                 - "--area={{ $b.area }}"
                 - "--minzoom={{ $b.minZoom }}"
                 - "--maxzoom={{ $b.maxZoom }}"
+                {{- if $b.languages }}
+                - "--languages={{ $b.languages }}"
+                {{- end }}
                 - "--threads={{ $b.threads }}"
                 - "--download-max-bandwidth={{ $b.downloadMaxBandwidth }}"
                 - "--tmpdir=/scratch/tmp"

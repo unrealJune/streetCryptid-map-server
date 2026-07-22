@@ -79,6 +79,7 @@
             "area": { "type": "string", "minLength": 1 },
             "minZoom": { "type": "integer", "minimum": 0, "maximum": 24 },
             "maxZoom": { "type": "integer", "minimum": 0, "maximum": 24 },
+            "languages": { "type": "string" },
             "suspend": { "type": "boolean" },
             "schedule": { "type": "string" },
             "nodeName": { "type": "string" },

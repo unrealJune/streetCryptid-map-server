@@ -629,10 +629,19 @@ Use Planetiler outside Kubernetes for the full bake:
 --download
 --area=planet
 --maxzoom=14
+--languages=en
 --nodemap-type=array
 --storage=mmap
 --output=/data/planet.pmtiles
 ```
+
+`--languages=en` restricts the baked `name:<lang>` label variants. OpenMapTiles
+otherwise emits ~40 languages per label feature, which inflates every raw tile
+and every SCB1 bundle. The base `name` (local), `name:latin`, `name:nonlatin`,
+and `name_int` are emitted regardless, so this yields local + English labels.
+The choice is global to the dataset; there is no per-request language selection.
+Changing it requires a re-bake, and the new dataset version invalidates the
+bundle cache automatically (cache keys and ETags are dataset-versioned).
 
 Expected workstation requirements:
 

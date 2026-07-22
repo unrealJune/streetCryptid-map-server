@@ -124,6 +124,12 @@ tiles:
     area: planet
     minZoom: 0
     maxZoom: 14
+    # Restrict baked name:<lang> label variants. OpenMapTiles otherwise emits
+    # ~40 languages per label feature, bloating tiles and bundles. "en" keeps
+    # name:en; the base name (local), name:latin, name:nonlatin, and name_int
+    # are always emitted regardless. Set "default" to restore the full OMT set,
+    # or "" to omit the flag (Planetiler default = full set).
+    languages: "en"
     # Suspended CronJob by default: trigger on demand with
     #   kubectl create job planet-bake-now --from=cronjob/<release>-bake
     # or set suspend=false to run on the schedule.

@@ -8,7 +8,12 @@ param(
     [string]$Version = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ"),
     [string]$OutDir = "./data",
     [string]$PlanetilerJar = "planetiler.jar",
-    [int]$MaxZoom = 14
+    [int]$MaxZoom = 14,
+    # Restrict baked name:<lang> label variants. OpenMapTiles otherwise emits
+    # ~40 languages per label feature, bloating tiles and bundles. "en" keeps
+    # name:en; the base name (local), name:latin, name:nonlatin, and name_int
+    # are always emitted regardless. Pass "default" to restore the full OMT set.
+    [string]$Languages = "en"
 )
 $ErrorActionPreference = "Stop"
 
@@ -21,6 +26,7 @@ java -Xmx56g -jar $PlanetilerJar `
     --download `
     --area=planet `
     --maxzoom=$MaxZoom `
+    --languages=$Languages `
     --nodemap-type=array `
     --storage=mmap `
     --output=$out
