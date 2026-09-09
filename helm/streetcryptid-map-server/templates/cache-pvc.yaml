@@ -1,0 +1,17 @@
+{{- if not .Values.persistence.cache.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "scms.fullname" . }}-cache
+  labels:
+    {{- include "scms.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.persistence.cache.size }}
+  {{- if .Values.persistence.cache.storageClass }}
+  storageClassName: {{ .Values.persistence.cache.storageClass | quote }}
+  {{- end }}
+{{- end }}

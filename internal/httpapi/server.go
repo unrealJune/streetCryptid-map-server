@@ -9,9 +9,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +23,7 @@ import (
 	"github.com/junephilip/streetcryptid-map-server/internal/martin"
 	"github.com/junephilip/streetcryptid-map-server/internal/privacy"
 	"github.com/junephilip/streetcryptid-map-server/internal/scb1"
+	"github.com/junephilip/streetcryptid-map-server/internal/scb2"
 )
 
 // TileBundleMediaType is the SCB1 response content type, matching the app.
@@ -31,13 +36,21 @@ type Config struct {
 	MartinCatalogURL string
 	Source           string // Martin source id, e.g. "planet"
 	DatasetVersion   string // derived from the active signed manifest
+	DatasetDigest    string // verified artifact SHA-256; protects v2 against reused release labels
 	BundleWorkers    int
 	BundleTimeout    time.Duration
+	BundleBuilds     int // concurrent complete builds, not individual tile reads
+	BundleSource     TileSource
 	// RatePerSec/Burst tune the per-client token bucket. Zero disables limits.
 	RatePerSec float64
 	Burst      float64
 	Logger     *slog.Logger
 	Now        func() time.Time
+}
+
+// TileSource returns transfer-decoded MVT or nil for a known-empty tile.
+type TileSource interface {
+	GetTileBytes(context.Context, privacy.TileCoord) ([]byte, error)
 }
 
 // Server holds handler dependencies.
@@ -49,6 +62,8 @@ type Server struct {
 	limiter *rateLimiter
 	log     *slog.Logger
 	workers chan struct{} // global concurrency bound across all bundle builds
+	builds  chan struct{}
+	source  TileSource
 }
 
 // New wires a server. workers bounds total concurrent upstream reads.
@@ -62,6 +77,15 @@ func New(cfg Config, client *martin.Client, c *cache.Cache) *Server {
 	if cfg.BundleTimeout <= 0 {
 		cfg.BundleTimeout = 60 * time.Second
 	}
+	if cfg.BundleBuilds <= 0 {
+		cfg.BundleBuilds = 1
+	}
+	if cfg.BundleSource == nil {
+		cfg.BundleSource = client
+	}
+	if c == nil {
+		c, _ = cache.New("", 0)
+	}
 	m := newMetrics()
 	s := &Server{
 		cfg:     cfg,
@@ -70,6 +94,8 @@ func New(cfg Config, client *martin.Client, c *cache.Cache) *Server {
 		metrics: m,
 		log:     cfg.Logger,
 		workers: make(chan struct{}, cfg.BundleWorkers),
+		builds:  make(chan struct{}, cfg.BundleBuilds),
+		source:  cfg.BundleSource,
 	}
 	if cfg.RatePerSec > 0 {
 		s.limiter = newRateLimiter(cfg.RatePerSec, cfg.Burst, cfg.Now)
@@ -85,6 +111,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	// Bundle pattern is more specific (6 segments) than coarse (4); no overlap.
 	mux.HandleFunc("GET /planet/bundle/v1/{x10}/{y10}/{tileZoom}", s.handleBundle)
+	mux.HandleFunc("GET /planet/bundle/v2/{x10}/{y10}/{tileZoom}", s.handleBundleV2)
+	mux.HandleFunc("OPTIONS /planet/bundle/v2/{x10}/{y10}/{tileZoom}", s.handleBundleOptions)
 	mux.HandleFunc("GET /planet/{z}/{x}/{y}", s.handleCoarse)
 	mux.HandleFunc("HEAD /planet/{z}/{x}/{y}", s.handleCoarse)
 	mux.HandleFunc("GET /livez", s.handleLivez)
@@ -175,92 +203,173 @@ func (s *Server) handleCoarse(w http.ResponseWriter, r *http.Request) {
 
 // --- Fine-detail privacy bundle ---
 
-func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
+func (s *Server) bundleRequest(w http.ResponseWriter, r *http.Request) (privacy.BundleRequest, bool) {
 	// Reject any request carrying query params, a body, or child hints. The
 	// endpoint accepts only the fixed anchor and data zoom.
-	if len(r.URL.RawQuery) != 0 {
-		http.Error(w, "no query parameters allowed", http.StatusBadRequest)
-		return
+	if r.URL.ForceQuery || len(r.URL.RawQuery) != 0 || r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		http.Error(w, "no query parameters or body allowed", http.StatusBadRequest)
+		return privacy.BundleRequest{}, false
 	}
 	x10, err1 := strconv.Atoi(r.PathValue("x10"))
 	y10, err2 := strconv.Atoi(r.PathValue("y10"))
 	tz, err3 := strconv.Atoi(r.PathValue("tileZoom"))
 	if err1 != nil || err2 != nil || err3 != nil {
 		http.Error(w, "bad bundle path", http.StatusBadRequest)
-		return
+		return privacy.BundleRequest{}, false
 	}
 	req, err := privacy.ValidateBundle(x10, y10, tz)
 	if err != nil {
 		http.Error(w, "invalid bundle request", http.StatusBadRequest)
-		return
+		return privacy.BundleRequest{}, false
 	}
 
 	cost := float64(uint(1) << uint(tz-privacy.PrivacyAnchorZoom)) // 2,4,8,16
 	if s.limiter != nil && !s.limiter.allow(clientIP(r), cost) {
 		http.Error(w, "rate limited", http.StatusTooManyRequests)
+		return privacy.BundleRequest{}, false
+	}
+	return req, true
+}
+
+func (s *Server) stageKey(req privacy.BundleRequest) string {
+	return fmt.Sprintf("%s:%s:%s:10:%d:%d:%d:stage", scb2.CodecVersion, url.PathEscape(s.cfg.DatasetVersion), s.cfg.DatasetDigest, req.AnchorX, req.AnchorY, req.TileZoom)
+}
+
+var errBuildBusy = errors.New("bundle build admission full")
+
+func (s *Server) admitted(build func() ([]byte, error)) ([]byte, error) {
+	select {
+	case s.builds <- struct{}{}:
+		defer func() { <-s.builds }()
+		return build()
+	default:
+		return nil, errBuildBusy
+	}
+}
+
+func (s *Server) stage(ctx context.Context, req privacy.BundleRequest) ([]byte, error) {
+	key := s.stageKey(req)
+	return s.cache.Do(key, func() ([]byte, error) {
+		if f, err := s.cache.Open(key); err == nil {
+			data, readErr := io.ReadAll(f)
+			if err := errors.Join(readErr, f.Close()); err != nil {
+				return nil, err
+			}
+			return data, nil
+		} else if errors.Is(err, cache.ErrCorrupt) {
+			s.log.Warn("discarded corrupt bundle stage; rebuilding", "err", err)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("read bundle stage: %w", err)
+		}
+		data, err := s.buildBundle(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.cache.Put(key, data); err != nil {
+			return nil, fmt.Errorf("persist bundle stage: %w", err)
+		}
+		return data, nil
+	})
+}
+
+func (s *Server) buildError(w http.ResponseWriter, req privacy.BundleRequest, err error) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Del("ETag")
+	w.Header().Del("Accept-Ranges")
+	s.metrics.inc("mapapi_bundle_error_total")
+	s.log.Warn("bundle build failed", "tileZoom", req.TileZoom, "err", err)
+	status := http.StatusBadGateway
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errBuildBusy) {
+		status = http.StatusServiceUnavailable
+		w.Header().Set("Retry-After", "2")
+	}
+	http.Error(w, "bundle unavailable", status)
+}
+
+func (s *Server) handleBundle(w http.ResponseWriter, r *http.Request) {
+	req, ok := s.bundleRequest(w, r)
+	if !ok {
 		return
 	}
-
-	etag := fmt.Sprintf("%q", fmt.Sprintf("%s:10:%d:%d:%d", s.cfg.DatasetVersion, x10, y10, tz))
+	etag := fmt.Sprintf("%q", fmt.Sprintf("%s:10:%d:%d:%d", s.cfg.DatasetVersion, req.AnchorX, req.AnchorY, req.TileZoom))
 	if match := r.Header.Get("If-None-Match"); match != "" && match == etag {
 		w.Header().Set("ETag", etag)
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 
-	key := fmt.Sprintf("%s:%d:%d:%d", s.cfg.DatasetVersion, x10, y10, tz)
+	key := s.stageKey(req)
 
 	// Cache hit: serve the stored gzipped bundle directly.
-	if s.cache != nil {
-		if data, ok := s.cache.Get(key); ok {
-			s.metrics.inc("mapapi_bundle_cache_hit_total")
-			s.writeBundle(w, etag, data)
+	if f, err := s.cache.Open(key); err == nil {
+		defer f.Close()
+		s.metrics.inc("mapapi_bundle_cache_hit_total")
+		s.bundleHeaders(w, etag, f.Size())
+		if r.Method != http.MethodHead {
+			if _, err := io.Copy(w, f); err != nil {
+				s.log.Warn("bundle response interrupted", "err", err)
+			}
+		}
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.log.Error("bundle cache read failed", "err", err)
+		if !errors.Is(err, cache.ErrCorrupt) {
+			s.buildError(w, req, err)
 			return
 		}
 	}
 
 	// Build once per key even under concurrent callers.
-	build := func() ([]byte, error) {
-		gz, err := s.buildBundle(r.Context(), req)
-		if err != nil {
-			return nil, err
-		}
-		if s.cache != nil {
-			s.cache.Put(key, gz)
-		}
-		return gz, nil
-	}
-
-	var data []byte
-	if s.cache != nil {
-		data, err = s.cache.Do(key, build)
-	} else {
-		data, err = build()
-	}
+	data, err := s.cache.Do(key+":request", func() ([]byte, error) {
+		return s.admitted(func() ([]byte, error) {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.cfg.BundleTimeout)
+			defer cancel()
+			return s.stage(ctx, req)
+		})
+	})
 	if err != nil {
-		s.metrics.inc("mapapi_bundle_error_total")
-		// Log without any child coordinate label; anchor+zoom only.
-		s.log.Warn("bundle build failed", "tileZoom", tz, "err", err.Error())
-		status := http.StatusBadGateway
-		if errors.Is(err, context.DeadlineExceeded) {
-			status = http.StatusServiceUnavailable
-		}
-		http.Error(w, "bundle unavailable", status)
+		s.buildError(w, req, err)
 		return
 	}
 	s.metrics.inc("mapapi_bundle_ok_total")
-	s.writeBundle(w, etag, data)
+	// Release the assembled buffer before a potentially slow transfer.
+	if f, err := s.cache.Open(key); err == nil {
+		data = nil
+		defer f.Close()
+		s.bundleHeaders(w, etag, f.Size())
+		if r.Method != http.MethodHead {
+			if _, err := io.Copy(w, f); err != nil {
+				s.log.Warn("bundle response interrupted", "err", err)
+			}
+		}
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.buildError(w, req, err)
+		return
+	}
+	// When persistence is disabled/too small, count an in-memory transfer
+	// against the build budget so slow readers cannot retain unbounded bundles.
+	select {
+	case s.builds <- struct{}{}:
+		defer func() { <-s.builds }()
+	default:
+		s.buildError(w, req, errBuildBusy)
+		return
+	}
+	s.bundleHeaders(w, etag, int64(len(data)))
+	if r.Method != http.MethodHead {
+		w.Write(data)
+	}
 }
 
-func (s *Server) writeBundle(w http.ResponseWriter, etag string, gz []byte) {
+func (s *Server) bundleHeaders(w http.ResponseWriter, etag string, size int64) {
 	h := w.Header()
 	h.Set("Content-Type", TileBundleMediaType)
 	h.Set("Content-Encoding", "gzip")
 	h.Set("ETag", etag)
 	h.Set("Cache-Control", "public, max-age=86400")
-	h.Set("Content-Length", strconv.Itoa(len(gz)))
+	h.Set("Content-Length", strconv.FormatInt(size, 10))
 	w.WriteHeader(http.StatusOK)
-	w.Write(gz)
 }
 
 // buildBundle fetches the complete fixed descendant set with bounded
@@ -270,9 +379,7 @@ func (s *Server) writeBundle(w http.ResponseWriter, etag string, gz []byte) {
 // but it also never commits a partial cache entry because build runs to
 // completion or errors atomically.
 func (s *Server) buildBundle(reqCtx context.Context, req privacy.BundleRequest) ([]byte, error) {
-	// Detach from the client request so one client leaving does not cancel a
-	// shared build, but keep a bounded overall deadline.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), s.cfg.BundleTimeout)
+	ctx, cancel := context.WithCancel(reqCtx)
 	defer cancel()
 
 	tiles := req.Descendants()
@@ -282,6 +389,7 @@ func (s *Server) buildBundle(reqCtx context.Context, req privacy.BundleRequest) 
 		wg       sync.WaitGroup
 		mu       sync.Mutex
 		firstErr error
+		total    = scb1.HeaderBytes + req.EntryCount()*4
 	)
 	sem := make(chan struct{}, s.cfg.BundleWorkers)
 
@@ -313,29 +421,200 @@ func (s *Server) buildBundle(reqCtx context.Context, req privacy.BundleRequest) 
 			}
 			defer func() { <-s.workers }()
 
-			bytes, err := s.client.GetTileBytes(ctx, t)
+			payload, err := s.source.GetTileBytes(ctx, t)
+			mu.Lock()
+			defer mu.Unlock()
 			if err != nil {
-				mu.Lock()
 				if firstErr == nil {
 					firstErr = err
 					cancel() // stop the rest; the whole bundle fails
 				}
-				mu.Unlock()
 				return
 			}
-			entries[i] = scb1.Entry{Bytes: bytes} // nil bytes => empty sentinel
+			if firstErr != nil {
+				return
+			}
+			if len(payload) > scb1.MaxDecompressedBytes-total {
+				firstErr = scb1.ErrTooLarge
+				cancel()
+				return
+			}
+			total += len(payload)
+			entries[i] = scb1.Entry{Bytes: payload}
 		}(i, t)
 	}
 	wg.Wait()
 	if firstErr != nil {
 		return nil, firstErr
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	raw, err := scb1.Encode(req, entries)
 	if err != nil {
 		return nil, err
 	}
-	return gzipBytes(raw)
+	gz, err := gzipBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return gz, nil
+}
+
+func streamHeaders(w http.ResponseWriter, etag string) {
+	h := w.Header()
+	h.Set("Content-Type", scb2.MediaType)
+	h.Set("Cache-Control", "public, max-age=86400, no-transform")
+	h.Set("ETag", etag)
+	h.Set("Accept-Ranges", "bytes")
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Expose-Headers", "ETag, Accept-Ranges, Content-Range, Content-Length")
+	h.Set("X-Accel-Buffering", "no")
+}
+
+func (s *Server) handleBundleOptions(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.bundleRequest(w, r); !ok {
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Range, If-Range, If-None-Match")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) handleBundleV2(w http.ResponseWriter, r *http.Request) {
+	req, ok := s.bundleRequest(w, r)
+	if !ok {
+		return
+	}
+	key := fmt.Sprintf("%s:%s:%s:10:%d:%d:%d", scb2.CodecVersion, url.PathEscape(s.cfg.DatasetVersion), s.cfg.DatasetDigest, req.AnchorX, req.AnchorY, req.TileZoom)
+	etag := fmt.Sprintf("%q", key)
+	streamHeaders(w, etag)
+	// Only single byte ranges are supported. Ignore multi-range requests rather
+	// than emitting a multipart representation or amplifying overlapping ranges.
+	if strings.Contains(r.Header.Get("Range"), ",") {
+		r = r.Clone(r.Context())
+		r.Header.Del("Range")
+	}
+	if f, err := s.cache.Open(key); err == nil {
+		defer f.Close()
+		s.metrics.inc("mapapi_bundle_cache_hit_total")
+		serveStreamContent(w, r, etag, f)
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.log.Error("bundle cache read failed", "err", err)
+		if !errors.Is(err, cache.ErrCorrupt) {
+			s.buildError(w, req, err)
+			return
+		}
+	}
+
+	streamed := false
+	writeFailed := false
+	// Conditional requests use ServeContent after materialization so Go applies
+	// all preconditions, including strong If-Range semantics, consistently.
+	progressive := r.Method == http.MethodGet && r.Header.Get("Range") == "" &&
+		r.Header.Get("If-None-Match") == "" && r.Header.Get("If-Match") == ""
+	data, err := s.cache.Do(key, func() ([]byte, error) {
+		return s.admitted(func() ([]byte, error) {
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.cfg.BundleTimeout)
+			defer cancel()
+			var out bytes.Buffer
+			out.Write(scb2.Header(req))
+			for i, stage := range scb2.Stages(req) {
+				gz, err := s.stage(ctx, stage)
+				if err != nil {
+					return nil, err
+				}
+				frame, err := scb2.Frame(stage, gz)
+				if err != nil {
+					return nil, err
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if out.Len()+len(frame) > scb2.MaxStreamBytes {
+					return nil, errors.New("scb2: stream exceeds bound")
+				}
+				out.Write(frame)
+				if progressive && !writeFailed {
+					streamed = true
+					controller := http.NewResponseController(w)
+					// A slow/disconnected subscriber must not wedge the shared build.
+					if err := controller.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+						s.log.Warn("stream deadline failed", "err", err)
+						writeFailed = true
+					}
+					chunk := frame
+					if i == 0 {
+						chunk = out.Bytes()
+					}
+					if !writeFailed {
+						_, err = w.Write(chunk)
+						if err == nil {
+							err = controller.Flush()
+						}
+						if err != nil {
+							s.log.Warn("bundle stream interrupted; build continues", "err", err)
+							writeFailed = true
+						}
+						// HTTP/2 write deadlines can expire even between writes.
+						// Restore the overall deadline while detail is being built.
+						deadline, _ := ctx.Deadline()
+						if err := controller.SetWriteDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+							s.log.Warn("stream deadline restore failed", "err", err)
+							writeFailed = true
+						}
+					}
+				}
+				// The overview is flushed above BEFORE starting the z14 build.
+			}
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if err := s.cache.Put(key, out.Bytes()); err != nil {
+				return nil, fmt.Errorf("persist stream: %w", err)
+			}
+			return out.Bytes(), nil
+		})
+	})
+	if err != nil {
+		if streamed {
+			s.metrics.inc("mapapi_bundle_error_total")
+			s.log.Warn("bundle stream aborted", "tileZoom", req.TileZoom, "err", err)
+			panic(http.ErrAbortHandler)
+		}
+		s.buildError(w, req, err)
+		return
+	}
+	s.metrics.inc("mapapi_bundle_ok_total")
+	if streamed {
+		if writeFailed {
+			panic(http.ErrAbortHandler)
+		}
+		return
+	}
+	if f, err := s.cache.Open(key); err == nil {
+		data = nil
+		defer f.Close()
+		serveStreamContent(w, r, etag, f)
+		return
+	} else if !errors.Is(err, os.ErrNotExist) {
+		s.buildError(w, req, err)
+		return
+	}
+	select {
+	case s.builds <- struct{}{}:
+		defer func() { <-s.builds }()
+	default:
+		s.buildError(w, req, errBuildBusy)
+		return
+	}
+	serveStreamContent(w, r, etag, bytes.NewReader(data))
 }
 
 func gzipBytes(raw []byte) ([]byte, error) {

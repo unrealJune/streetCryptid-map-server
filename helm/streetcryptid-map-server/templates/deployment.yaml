@@ -93,13 +93,15 @@ spec:
             - name: BUNDLE_CACHE_DIR
               value: {{ .Values.api.cache.dir | quote }}
             - name: BUNDLE_CACHE_MAX_BYTES
-              value: {{ .Values.api.cache.maxBytes | quote }}
+              value: {{ .Values.api.cache.maxBytes | int64 | quote }}
             - name: BUNDLE_WORKERS
               value: {{ .Values.api.bundleWorkers | quote }}
+            - name: BUNDLE_MAX_BUILDS
+              value: {{ .Values.api.bundleMaxBuilds | quote }}
             - name: BUNDLE_REQUEST_TIMEOUT
               value: {{ .Values.api.bundleRequestTimeout | quote }}
             - name: BUNDLE_MAX_BYTES
-              value: {{ .Values.api.bundleMaxBytes | quote }}
+              value: {{ .Values.api.bundleMaxBytes | int64 | quote }}
             - name: HTTP_READ_TIMEOUT
               value: {{ .Values.api.httpReadTimeout | quote }}
             - name: HTTP_WRITE_TIMEOUT
@@ -211,8 +213,8 @@ spec:
           persistentVolumeClaim:
             claimName: {{ .Values.persistence.cache.existingClaim }}
           {{- else }}
-          emptyDir:
-            sizeLimit: {{ .Values.persistence.cache.sizeLimit }}
+          persistentVolumeClaim:
+            claimName: {{ include "scms.fullname" . }}-cache
           {{- end }}
         - name: tmp
           emptyDir:

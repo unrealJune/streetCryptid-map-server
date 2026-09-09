@@ -90,3 +90,37 @@ func Encode(req privacy.BundleRequest, entries []Entry) ([]byte, error) {
 	}
 	return buf, nil
 }
+
+// Validate checks the exact requested header, complete row-major descendant
+// count, length bounds and absence of trailing bytes without copying payloads.
+func Validate(req privacy.BundleRequest, raw []byte) error {
+	if len(raw) < HeaderBytes || len(raw) > MaxDecompressedBytes {
+		return fmt.Errorf("scb1: invalid size")
+	}
+	if string(raw[:4]) != Magic || raw[4] != Version ||
+		raw[5] != privacy.PrivacyAnchorZoom || raw[6] != byte(req.TileZoom) || raw[7] != 0 ||
+		binary.BigEndian.Uint32(raw[8:]) != uint32(req.AnchorX) ||
+		binary.BigEndian.Uint32(raw[12:]) != uint32(req.AnchorY) ||
+		binary.BigEndian.Uint32(raw[16:]) != uint32(req.EntryCount()) {
+		return fmt.Errorf("scb1: mismatched header")
+	}
+	offset := HeaderBytes
+	for range req.EntryCount() {
+		if len(raw)-offset < 4 {
+			return fmt.Errorf("scb1: missing descendant")
+		}
+		n := binary.BigEndian.Uint32(raw[offset:])
+		offset += 4
+		if n == EmptyTileLength {
+			continue
+		}
+		if uint64(n) > uint64(len(raw)-offset) {
+			return fmt.Errorf("scb1: truncated descendant")
+		}
+		offset += int(n)
+	}
+	if offset != len(raw) {
+		return fmt.Errorf("scb1: trailing bytes")
+	}
+	return nil
+}

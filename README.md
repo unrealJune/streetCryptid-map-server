@@ -20,7 +20,8 @@ Ingress / Service (only :8080)
         │
         ▼
    map-api :8080 ──┐
-        │          └── bundle cache (emptyDir/PVC)
+        │          ├── persistent checksummed bundle cache (PVC)
+        │          └── direct read-only active PMTiles (fine bundles)
         ▼
   localhost:3000  Martin sidecar ── read-only active planet release
         ▲
@@ -35,6 +36,7 @@ Ingress / Service (only :8080)
 | `GET`/`HEAD` | `/planet/{z}/{x}/{y}` | 0–10 | Proxies Martin MVT bytes. |
 | `GET`/`HEAD` | `/planet/{z}/{x}/{y}` | 11–14 | **404 without contacting Martin.** |
 | `GET` | `/planet/bundle/v1/{x10}/{y10}/{tileZoom}` | 11–14 | Returns the complete descendant set as one SCB1 bundle. |
+| `GET`/`HEAD` | `/planet/bundle/v2/{x10}/{y10}/{tileZoom}` | 11–14 | Progressive SCB2 stages; complete cached representations support byte ranges. |
 | `GET` | `/livez` `/readyz` `/metrics` | — | Health + Prometheus metrics (metrics is cluster-internal). |
 
 A z`N` bundle contains every descendant under the fixed z10 anchor:
@@ -42,6 +44,153 @@ z11→4, z12→16, z13→64, z14→256 entries, deterministic row-major order. T
 format (`SCB1`) is the server side of the app parser in
 `streetCryptid/src/features/map/tiles/tile-bundle.ts` — the golden fixture in
 `testdata/scb1-z11.golden` locks the byte layout.
+
+Fine bundles read the active PMTiles file **directly**, without per-descendant
+HTTP fanout through Martin. Martin still serves raw z0–10 and supplies the
+readiness catalog. The v1 media type, outer gzip, SCB1 layout, deterministic
+descendant ordering, and ETag format are unchanged.
+
+### Progressive/resumable SCB2
+
+V2 accepts only the same fixed z10 anchor and requested zoom. Query parameters
+(including child hints), request bodies, and non-z10 anchors are not supported.
+It never accepts a viewport, child tile, or target-dependent priority.
+
+The response is `application/vnd.streetcryptid.tile-stream`, with
+`Cache-Control: public, max-age=86400, no-transform` and **no HTTP
+Content-Encoding**. Gzip belongs to each stage, not to the HTTP representation.
+All integers below are unsigned big-endian:
+
+| Header offset | Bytes | Value |
+| --- | --- | --- |
+| 0 | 4 | ASCII `SCB2` |
+| 4 | 1 | Version `2` |
+| 5 | 1 | Anchor zoom `10` |
+| 6 | 1 | Requested tile zoom |
+| 7 | 1 | Reserved `0` |
+| 8 | 4 | Anchor x10 |
+| 12 | 4 | Anchor y10 |
+| 16 | 4 | Stage count |
+
+The header is exactly 20 bytes. Requested z14 has stages **[13, 14]**; all other
+requests have one stage **[tileZoom]**. Each frame has a 40-byte prefix:
+compressed length at offset 0 (4 bytes), raw SCB1 length at offset 4 (4 bytes),
+and SHA-256 of the raw SCB1 at offset 8 (32 bytes). The complete gzip-compressed
+SCB1 payload immediately follows. Each stage contains **all** descendants of
+the same anchor, validated in row-major order. Raw stages are capped at 64 MiB,
+compressed stages at 65 MiB, and the full stream at
+`2 * (65 MiB + 40) + 20` bytes.
+
+On an ordinary cold GET, the header and complete z13 overview are written and
+flushed **before** starting z14. Concurrent requests for that same stream share
+the build; followers can receive the completed representation. A disconnected
+client does not cancel the bounded build. A failure after streaming starts
+aborts the HTTP stream; clients must require every expected stage, check each
+raw length and digest, and never treat a truncated prefix as a complete bundle.
+Only a successful full representation enters the v2 cache.
+
+Completed responses advertise `Accept-Ranges: bytes` and support a **single**
+`Range: bytes=...` via Go's `http.ServeContent`: closed, open-ended and suffix
+ranges, 206/Content-Range, 416 for unsatisfiable ranges, HEAD and conditional
+GET. Multipart ranges are ignored (a full 200 response). A cold Range request
+may build the whole representation before answering. Resume with the stored
+**strong ETag** in `If-Range`; a changed dataset or codec, weak ETag, or date
+validator produces a full 200 rather than mixing versions. There is no
+Last-Modified validator. The v2 ETag/cache namespace includes the release label,
+artifact SHA-256, z10 anchor, requested zoom and
+`v2-scb1-gzip-go1.26-r1`. Gzip has timestamp zero; bump the codec identifier when
+compressor/encoding changes alter bytes.
+
+A resume at exactly the completed representation length returns 416 with the
+current strong ETag and `Content-Range: bytes */N`, including on a cold cache.
+This lets a client recognize a fully saved transfer after a crash, but only
+when both the saved ETag and byte count match. SCB2 preserves the ETag on 416
+without changing Go's global error-header policy; that error response uses
+`Cache-Control: no-store, no-transform` and no Content-Encoding. A changed
+If-Range still returns the full 200 representation, even at the old end offset.
+
+V2 includes public CORS response headers and an OPTIONS preflight allowing
+Range/If-Range/If-None-Match, with ETag/range/length headers exposed. The server
+sends `X-Accel-Buffering: no`; any ingress/CDN must also honor no-transform and
+avoid response buffering/compression on this route for early stages to arrive
+progressively. Proxy timeouts must cover the configured build duration.
+
+Cross-language conformance fixtures for **10/164/357/11**, four empty sentinels:
+`testdata/scb2-z11-empty.json` contains raw SCB1, gzip, raw SHA-256 and full SCB2
+as hex; `testdata/scb2-z11-empty.scb2` is the exact binary response.
+The golden test regenerates them only with `UPDATE_SCB2_FIXTURE=1`.
+
+For local app integration, run the production HTTP handler, direct PMTiles
+reader and cache against a tiny generated empty archive (no planet download,
+sidecar installation, or deployment):
+
+```powershell
+Set-Location C:\Users\june\streetCryptid-map-server
+go run .\cmd\fixture-server -listen 127.0.0.1:8089
+```
+
+The golden endpoint is `http://127.0.0.1:8089/planet/bundle/v2/164/357/11`
+(107 bytes); z14 returns empty, complete stages [13,14]. The command refuses
+non-loopback bindings. It uses a temporary cache by default; `-cache-dir` can
+select an isolated persistent fixture cache for restart testing. `/readyz`
+checks a local empty Martin stub; fine bundles always use the real PMTiles
+reader. The fixture command is not included in the production image.
+
+With an existing app checkout and its dependencies installed, a second terminal
+can run the cross-language check without modifying app source:
+
+```powershell
+bun run .\scripts\check-app-conformance.ts C:\Users\june\streetCryptid http://127.0.0.1:8089
+```
+
+This imports the app's actual `TileStreamDecoder`, `StreamingBundleSource` and
+`SqliteBundleResumeStore`. It checks golden decoding under byte fragmentation,
+live HTTP bytes, SQLite close/reopen prefix resumes, 206, matching end-offset
+416, changed-ETag full replacement, and complete z13/z14 stage delivery.
+It uses host Bun fetch, SHA-256 and SQLite adapters, not the device-native
+Expo implementations. No Bun dependencies are added to the Go server.
+
+### Persistent cache and bounded builds
+
+The default cache budget is **4 GiB of representation payloads**, on a **6 GiB
+ReadWriteOnce PVC** (or `persistence.cache.existingClaim`). The extra space covers
+file metadata/allocation and atomic-write headroom. The chart enforces one
+replica and Recreate: this cache is single-writer, not a shared multi-pod index.
+The previous emptyDir default did not survive pod replacement.
+
+Each immutable `.bundle` file atomically contains its key, size, SHA-256 and
+payload. Startup verifies those records, restores LRU from last-access mtimes,
+removes corrupt/incomplete cache-owned files and trims to the configured byte
+budget. Legacy unindexed `.scb1gz` files are removed once. Reads recheck integrity
+and use a seekable file view, not a whole-response `ReadFile`. Active readers pin
+entries; eviction never drops their byte accounting or invalidates a transfer.
+If all eviction candidates are pinned, insertion fails explicitly. IO failures
+are reported, not silently treated as successful persistence. The index also
+has a 100,000-entry cap to bound tiny-file overhead.
+
+V1 and v2 reuse complete gzipped SCB1 stage caches; complete SCB2 files also
+include the stage bytes so cache-hit transfers and ranges need only one file.
+Both copies count toward the same LRU budget. Oversized individual cache objects
+and explicitly disabled persistence still allow uncached responses.
+
+`BUNDLE_MAX_BUILDS` defaults to **1**, bounding whole-build working sets across
+both versions; overload returns 503 with Retry-After. `BUNDLE_WORKERS` remains
+**16**, a global tile-read bound, not increased fanout. The overall
+`BUNDLE_REQUEST_TIMEOUT` (default 60s) covers both stages, including detached
+work. Subscriber writes have a 5s deadline so a stalled client cannot hold a
+build indefinitely. The chart gives the API a 1 GiB memory limit; increasing
+build admission requires budgeting memory for additional complete stages.
+
+The local reader supports PMTiles **v3 MVT**, internal and tile compression
+**none/gzip**, Hilbert IDs, root/leaf directories, sparse entries and RLE.
+It bounds individual decoded tiles at 16 MiB, decoded directories at 8 MiB /
+262,144 entries, directory traversal at four levels, and its leaf-directory LRU
+at 32 MiB / 4,096 directories. Invalid offsets, truncation, overflow, gzip
+failures, cycles and unsupported compression fail explicitly; there is **no
+Martin fallback** in the serving binary. The verified active release's file is
+opened once and pinned for the server lifetime. A missing/inconsistent active
+pointer or unsupported archive prevents startup rather than using an
+`unknown` dataset namespace.
 
 ### The privacy boundary is compiled in
 
@@ -117,7 +266,8 @@ docker build -t streetcryptid-map-server .
 ```
 
 Runtime configuration is operational only (see `internal/httpapi`, `cmd/server`):
-`MARTIN_URL`, `BUNDLE_CACHE_DIR`, `BUNDLE_WORKERS`, `TILE_DATA_DIR`,
+`MARTIN_URL`, `BUNDLE_CACHE_DIR`, `BUNDLE_CACHE_MAX_BYTES`, `BUNDLE_MAX_BUILDS`,
+`BUNDLE_WORKERS`, `TILE_DATA_DIR`,
 `TILE_MANIFEST_URL`, `TILE_MANIFEST_PUBLIC_KEY_FILE`, `TILE_UPDATE_INTERVAL`, etc.
 The privacy constants are absent from configuration by design.
 
@@ -153,6 +303,8 @@ docker pull ghcr.io/unrealjune/streetcryptid-map-server:<semver>
 cmd/server            process, config, subcommands, graceful shutdown
 internal/privacy      compile-time boundary, XYZ validation, descendant math
 internal/scb1         strict SCB1 encoder + size accounting
+internal/scb2         progressive framing + raw stage integrity + golden fixture
+internal/pmtiles      bounded direct PMTiles v3 file reader + directory LRU
 internal/martin       bounded localhost Martin client
 internal/cache        disk LRU bundle cache + in-flight dedup
 internal/httpapi      routes, coarse + bundle handlers, health, metrics, limits

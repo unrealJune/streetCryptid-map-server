@@ -1,11 +1,196 @@
 package cache
 
 import (
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestRestartRestoresIntegrityAndLRU(t *testing.T) {
+	dir := t.TempDir()
+	c, err := New(dir, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"a", "b", "c"} {
+		if err := c.Put(key, bytes.Repeat([]byte(key), 4)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-time.Hour)
+	for i, key := range []string{"a", "b", "c"} {
+		at := old.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(filepath.Join(dir, fileFor(key)), at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, ok := c.Get("a"); !ok {
+		t.Fatal("missing a")
+	}
+	restored, err := New(dir, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Bytes() != 8 {
+		t.Fatal(restored.Bytes())
+	}
+	if _, ok := restored.Get("b"); ok {
+		t.Fatal("LRU ordering not restored")
+	}
+	for _, key := range []string{"a", "c"} {
+		if got, ok := restored.Get(key); !ok || len(got) != 4 {
+			t.Fatal("lost valid entry", key)
+		}
+	}
+}
+
+func TestCorruptionRestartAndLiveRead(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(fmtBool(restart), func(t *testing.T) {
+			dir := t.TempDir()
+			c, err := New(dir, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Put("k", []byte("payload")); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, fileFor("k"))
+			f, err := os.OpenFile(path, os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fi, err := f.Stat()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.WriteAt([]byte{0}, fi.Size()-1); err != nil {
+				t.Fatal(err)
+			}
+			f.Close()
+			if restart {
+				c, err = New(dir, 100)
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err := c.Open("k"); !errors.Is(err, ErrCorrupt) {
+					t.Fatalf("error = %v", err)
+				}
+			}
+			if c.Bytes() != 0 {
+				t.Fatal("corrupt entry still counted")
+			}
+			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("corrupt file still present", err)
+			}
+			if err := c.Put("k", []byte("rebuilt")); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func fmtBool(b bool) string {
+	if b {
+		return "restart"
+	}
+	return "live"
+}
+
+func TestInterruptedWriteAndIOErrors(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".bundle-interrupted"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, fileFor("bad")), []byte("short"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := New(dir, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Bytes() != 0 {
+		t.Fatal("partial files restored")
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 0 {
+		t.Fatalf("cleanup: %v %v", files, err)
+	}
+	// Replace the cache directory with a regular file: writes must surface IO failure.
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("k", []byte("abc")); err == nil {
+		t.Fatal("IO failure hidden")
+	}
+}
+
+func TestOpenSurvivesEvictionAndImmutableKeys(t *testing.T) {
+	c, err := New(t.TempDir(), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("a", []byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("a", []byte("efgh")); err == nil {
+		t.Fatal("immutable collision accepted")
+	}
+	f, err := c.Open("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := c.Put("b", []byte("efgh")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("c", []byte("ijkl")); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := c.Get("b"); ok {
+		t.Fatal("unpinned LRU entry should be evicted")
+	}
+	var got [4]byte
+	if _, err := f.ReadAt(got[:], 0); err != nil || string(got[:]) != "abcd" {
+		t.Fatal("open reader invalidated", err)
+	}
+
+}
+
+func TestPinnedCapacityIsBounded(t *testing.T) {
+	c, err := New(t.TempDir(), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("a", []byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	f, err := c.Open("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("b", []byte("efgh")); !errors.Is(err, ErrPinned) {
+		t.Fatalf("pinned capacity: %v", err)
+	}
+	if c.Bytes() != 4 {
+		t.Fatal("pinned bytes not accounted")
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put("b", []byte("efgh")); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestPutGetRoundTrip(t *testing.T) {
 	c, err := New(t.TempDir(), 1<<20)
