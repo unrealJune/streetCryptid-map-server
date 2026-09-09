@@ -7,7 +7,7 @@
 nameOverride: ""
 fullnameOverride: ""
 
-# Single replica by default: the bundle cache is node-local (emptyDir) and the
+# Single replica by default: the bundle cache is single-writer (PVC) and the
 # tiles PVC is ReadWriteOnce. Do not scale up until cross-replica cache
 # coordination is proven.
 replicaCount: 1
@@ -51,6 +51,7 @@ api:
   port: 8080
   # Operational runtime configuration only (no privacy constants).
   bundleWorkers: 16
+  bundleMaxBuilds: 1          # bounded whole-bundle memory, independent of workers
   bundleRequestTimeout: 60s
   bundleMaxBytes: 67108864     # 64 MiB decompressed cap
   httpReadTimeout: 15s
@@ -59,16 +60,16 @@ api:
   rateLimitPerSec: 20
   rateLimitBurst: 120
   cache:
-    # Directory the API writes completed gzipped bundles to.
+    # Persistent, checksummed SCB1 stages and complete SCB2 representations.
     dir: /cache
-    maxBytes: 536870912         # 512 MiB
+    maxBytes: 4294967296        # 4 GiB payload budget
   resources:
     requests:
       cpu: 100m
       memory: 128Mi
     limits:
       cpu: "1"
-      memory: 512Mi
+      memory: 1Gi
 
 # --- Tile data: bootstrap + updater -----------------------------------------
 tiles:
@@ -177,9 +178,11 @@ persistence:
     # Sized for at least two full releases plus one resumable staging file.
     size: 250Gi
   cache:
-    # emptyDir by default; set existingClaim to use a PVC.
+    # Single-writer PVC survives pod replacement; allow space for metadata,
+    # filesystem allocation, and one bounded atomic temporary representation.
     existingClaim: ""
-    sizeLimit: 1Gi
+    size: 6Gi
+    storageClass: ""
 
 # --- Service ----------------------------------------------------------------
 service:

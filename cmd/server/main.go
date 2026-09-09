@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -29,6 +30,7 @@ import (
 	"github.com/junephilip/streetcryptid-map-server/internal/cache"
 	"github.com/junephilip/streetcryptid-map-server/internal/httpapi"
 	"github.com/junephilip/streetcryptid-map-server/internal/martin"
+	"github.com/junephilip/streetcryptid-map-server/internal/pmtiles"
 	"github.com/junephilip/streetcryptid-map-server/internal/tilesync"
 )
 
@@ -80,18 +82,29 @@ func runServe(log *slog.Logger) error {
 		MaxTileBytes: envInt64("BUNDLE_MAX_BYTES", 64*1024*1024),
 	})
 
-	cch, err := cache.New(os.Getenv("BUNDLE_CACHE_DIR"), envInt64("BUNDLE_CACHE_MAX_BYTES", 512*1024*1024))
+	cch, err := cache.New(os.Getenv("BUNDLE_CACHE_DIR"), envInt64("BUNDLE_CACHE_MAX_BYTES", 4*1024*1024*1024))
 	if err != nil {
 		return fmt.Errorf("cache: %w", err)
 	}
 
-	datasetVersion := deriveDatasetVersion(log)
+	dataset, path, err := activeDataset(os.Getenv("TILE_DATA_DIR"))
+	if err != nil {
+		return err
+	}
+	bundleSource, err := pmtiles.Open(path)
+	if err != nil {
+		return fmt.Errorf("active PMTiles: %w", err)
+	}
+	defer bundleSource.Close()
 
 	srv := httpapi.New(httpapi.Config{
 		MartinBaseURL:    martinURL,
 		MartinCatalogURL: catalogURL,
 		Source:           source,
-		DatasetVersion:   datasetVersion,
+		DatasetVersion:   dataset.Version,
+		DatasetDigest:    strings.ToLower(dataset.SHA256),
+		BundleSource:     bundleSource,
+		BundleBuilds:     int(envInt64("BUNDLE_MAX_BUILDS", 1)),
 		BundleWorkers:    int(envInt64("BUNDLE_WORKERS", 16)),
 		BundleTimeout:    envDuration("BUNDLE_REQUEST_TIMEOUT", 60*time.Second),
 		RatePerSec:       envFloat("RATE_LIMIT_PER_SEC", 20),
@@ -118,7 +131,7 @@ func runServe(log *slog.Logger) error {
 		_ = httpSrv.Shutdown(shutCtx)
 	}()
 
-	log.Info("map api listening", "addr", httpSrv.Addr, "dataset", datasetVersion, "version", version)
+	log.Info("map api listening", "addr", httpSrv.Addr, "dataset", dataset.Version, "version", version)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
@@ -126,20 +139,44 @@ func runServe(log *slog.Logger) error {
 	return nil
 }
 
-// deriveDatasetVersion reads the active local manifest for TILESET_VERSION. It
-// is derived, never configured, so a bundle cache namespace tracks the data.
-func deriveDatasetVersion(log *slog.Logger) string {
-	dataDir := os.Getenv("TILE_DATA_DIR")
+// The bootstrap verifies the large artifact. Serve pins that exact release file
+// for its lifetime, rather than following a mutable "current" symlink per read.
+func activeDataset(dataDir string) (*tilesync.Manifest, string, error) {
 	if dataDir == "" {
-		return "unknown"
+		return nil, "", errors.New("TILE_DATA_DIR is required for direct bundle reads")
 	}
 	st := tilesync.NewStore(dataDir, nil)
 	ptr, err := st.ReadActivePointer()
 	if err != nil {
-		log.Warn("no active dataset pointer; using 'unknown'", "err", err.Error())
-		return "unknown"
+		return nil, "", fmt.Errorf("active dataset pointer: %w", err)
 	}
-	return ptr.Version
+	if ptr.SafeDir == "" || ptr.SafeDir == "." || ptr.SafeDir == ".." ||
+		strings.ContainsAny(ptr.SafeDir, `/\`) || filepath.IsAbs(ptr.SafeDir) {
+		return nil, "", errors.New("invalid active release directory")
+	}
+	path := st.PMTilesPathFor(ptr.SafeDir)
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(path), "manifest.json"))
+	if err != nil {
+		return nil, "", err
+	}
+	m, err := tilesync.ParseManifest(raw)
+	if err != nil {
+		return nil, "", err
+	}
+	if m.Version != ptr.Version || m.MinZoom != 0 || m.MaxZoom != 14 {
+		return nil, "", errors.New("active manifest does not match pointer or required z0-14 coverage")
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, "", err
+	}
+	if fi.Size() != m.Size {
+		return nil, "", errors.New("active artifact size differs from verified manifest")
+	}
+	if err := tilesync.VerifyPMTilesAgainstManifest(path, m); err != nil {
+		return nil, "", err
+	}
+	return m, path, nil
 }
 
 // --- tiles subcommands ---
