@@ -33,7 +33,7 @@ Ingress / Service (only :8080)
 
 | Method | Path | Zoom | Behavior |
 | ------ | ---- | ---- | -------- |
-| `GET`/`HEAD` | `/planet/{z}/{x}/{y}` | 0–10 | Proxies Martin MVT bytes. |
+| `GET`/`HEAD` | `/planet/{z}/{x}/{y}` | 0–10 | Proxies Martin MVT bytes, gzip-encoded as stored when the client accepts gzip (inflated otherwise); `Cache-Control: public, max-age=86400`, `Vary: Accept-Encoding`. |
 | `GET`/`HEAD` | `/planet/{z}/{x}/{y}` | 11–14 | **404 without contacting Martin.** |
 | `GET` | `/planet/bundle/v1/{x10}/{y10}/{tileZoom}` | 11–14 | Returns the complete descendant set as one SCB1 bundle. |
 | `GET`/`HEAD` | `/planet/bundle/v2/{x10}/{y10}/{tileZoom}` | 11–14 | Progressive SCB2 stages; complete cached representations support byte ranges. |

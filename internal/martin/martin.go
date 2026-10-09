@@ -5,6 +5,8 @@
 package martin
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -84,6 +86,9 @@ func (c *Client) GetTile(ctx context.Context, z, x, y int) (*TileResponse, error
 	if err != nil {
 		return nil, err
 	}
+	// Asking explicitly disables net/http's transparent decompression, so the
+	// stored gzip bytes and their Content-Encoding reach the caller intact.
+	req.Header.Set("Accept-Encoding", "gzip")
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -118,9 +123,34 @@ func (c *Client) GetTile(ctx context.Context, z, x, y int) (*TileResponse, error
 	}, nil
 }
 
+// RawBody returns the tile bytes with any gzip transfer encoding removed.
+// The inflated size is bounded by limit; larger tiles are an error.
+func (t *TileResponse) RawBody(limit int64) ([]byte, error) {
+	switch t.ContentEncoding {
+	case "", "identity":
+		return t.Body, nil
+	case "gzip":
+	default:
+		return nil, fmt.Errorf("martin: unsupported content encoding %q", t.ContentEncoding)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(t.Body))
+	if err != nil {
+		return nil, fmt.Errorf("martin: gzip: %w", err)
+	}
+	defer zr.Close()
+	raw, err := io.ReadAll(io.LimitReader(zr, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("martin: gzip: %w", err)
+	}
+	if int64(len(raw)) > limit {
+		return nil, fmt.Errorf("martin: inflated tile exceeds %d bytes", limit)
+	}
+	return raw, nil
+}
+
 // GetTileBytes fetches a descendant for a bundle. It returns (nil, nil) for an
-// empty tile so the encoder can write the sentinel. Martin returns MVT bytes
-// transfer-decoded by net/http, which is what SCB1 stores.
+// empty tile so the encoder can write the sentinel. Bytes are raw MVT, which
+// is what SCB1 v1/v2 entries store.
 func (c *Client) GetTileBytes(ctx context.Context, t privacy.TileCoord) ([]byte, error) {
 	resp, err := c.GetTile(ctx, t.Z, t.X, t.Y)
 	if errors.Is(err, ErrEmpty) {
@@ -129,7 +159,31 @@ func (c *Client) GetTileBytes(ctx context.Context, t privacy.TileCoord) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	return resp.Body, nil
+	raw, err := resp.RawBody(c.maxTileBytes)
+	if err != nil || len(raw) == 0 {
+		return nil, err
+	}
+	return raw, nil
+}
+
+// GetTileStored returns the tile as the upstream stores it plus whether it
+// is a complete gzip member. (nil, false, nil) means an empty tile.
+func (c *Client) GetTileStored(ctx context.Context, t privacy.TileCoord) ([]byte, bool, error) {
+	resp, err := c.GetTile(ctx, t.Z, t.X, t.Y)
+	if errors.Is(err, ErrEmpty) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	switch resp.ContentEncoding {
+	case "", "identity":
+		return resp.Body, false, nil
+	case "gzip":
+		return resp.Body, true, nil
+	default:
+		return nil, false, fmt.Errorf("martin: unsupported content encoding %q", resp.ContentEncoding)
+	}
 }
 
 // Healthy reports whether the Martin catalog is reachable over localhost and

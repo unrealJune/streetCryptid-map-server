@@ -46,6 +46,12 @@ func newFakeMartin() *fakeMartin {
 		binary.BigEndian.PutUint32(b[0:], uint32(z))
 		binary.BigEndian.PutUint32(b[4:], uint32(x))
 		binary.BigEndian.PutUint32(b[8:], uint32(y))
+		// Like Martin: PMTiles stores gzip, sent as-is when the client accepts it.
+		if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Write(fakeTileGzip(b[:]))
+			return
+		}
 		w.Write(b[:])
 	})
 	f.srv = httptest.NewServer(mux)
@@ -53,6 +59,23 @@ func newFakeMartin() *fakeMartin {
 }
 
 func (f *fakeMartin) close() { f.srv.Close() }
+
+// fakeTileGzip is the fake's deterministic stored representation of a tile.
+func fakeTileGzip(raw []byte) []byte {
+	gz, err := gzipBytes(raw)
+	if err != nil {
+		panic(err)
+	}
+	return gz
+}
+
+func fakeTileRaw(z, x, y int) []byte {
+	var b [12]byte
+	binary.BigEndian.PutUint32(b[0:], uint32(z))
+	binary.BigEndian.PutUint32(b[4:], uint32(x))
+	binary.BigEndian.PutUint32(b[8:], uint32(y))
+	return b[:]
+}
 
 func newTestServer(t *testing.T, f *fakeMartin) *Server {
 	t.Helper()
@@ -80,6 +103,57 @@ func TestCoarseZoomsAccepted(t *testing.T) {
 		if rr.Code != http.StatusOK {
 			t.Fatalf("z%d got %d", z, rr.Code)
 		}
+	}
+}
+
+func TestCoarseGzipPassthrough(t *testing.T) {
+	f := newFakeMartin()
+	defer f.close()
+	h := newTestServer(t, f).Handler()
+	want := fakeTileGzip(fakeTileRaw(10, 164, 357))
+	for _, method := range []string{"GET", "HEAD"} {
+		r := httptest.NewRequest(method, "/planet/10/164/357", nil)
+		r.Header.Set("Accept-Encoding", "gzip, deflate, br")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, r)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s got %d", method, rr.Code)
+		}
+		hd := rr.Header()
+		if hd.Get("Content-Encoding") != "gzip" || hd.Get("Vary") != "Accept-Encoding" ||
+			hd.Get("Cache-Control") != "public, max-age=86400" ||
+			hd.Get("Content-Length") != fmt.Sprint(len(want)) {
+			t.Fatalf("%s headers %v", method, hd)
+		}
+		if method == "GET" && !bytes.Equal(rr.Body.Bytes(), want) {
+			t.Fatal("body is not the upstream gzip bytes")
+		}
+	}
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(rr.Body.String(), "mapapi_coarse_upstream_gzip_total 2") {
+		t.Fatalf("metrics missing upstream gzip counter:\n%s", rr.Body.String())
+	}
+}
+
+func TestCoarseInflatesForClientWithoutGzip(t *testing.T) {
+	f := newFakeMartin()
+	defer f.close()
+	h := newTestServer(t, f).Handler()
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("GET", "/planet/10/164/357", nil))
+	want := fakeTileRaw(10, 164, 357)
+	if rr.Code != http.StatusOK || rr.Header().Get("Content-Encoding") != "" ||
+		rr.Header().Get("Content-Length") != fmt.Sprint(len(want)) || !bytes.Equal(rr.Body.Bytes(), want) {
+		t.Fatalf("got %d %v %x", rr.Code, rr.Header(), rr.Body.Bytes())
+	}
+	if rr.Header().Get("Vary") != "Accept-Encoding" || rr.Header().Get("Cache-Control") != "public, max-age=86400" {
+		t.Fatal("inflated response lost cache headers")
+	}
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	if !strings.Contains(rr.Body.String(), "mapapi_coarse_inflated_total 1") {
+		t.Fatalf("metrics missing inflated counter:\n%s", rr.Body.String())
 	}
 }
 

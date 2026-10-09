@@ -190,15 +190,35 @@ func (s *Server) handleCoarse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.metrics.inc("mapapi_coarse_ok_total")
+	body, encoding := resp.Body, resp.ContentEncoding
+	if encoding == "gzip" {
+		s.metrics.inc("mapapi_coarse_upstream_gzip_total")
+		// Real clients accept gzip; this keeps a plain curl working.
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			body, err = resp.RawBody(16 << 20)
+			if err != nil {
+				s.metrics.inc("mapapi_coarse_error_total")
+				s.log.Warn("coarse inflate failure", "zoom", z, "err", err.Error())
+				http.Error(w, "upstream error", http.StatusBadGateway)
+				return
+			}
+			encoding = ""
+			s.metrics.inc("mapapi_coarse_inflated_total")
+		}
+	}
+	h := w.Header()
 	copyHeader(w, "Content-Type", resp.ContentType)
-	copyHeader(w, "Content-Encoding", resp.ContentEncoding)
+	copyHeader(w, "Content-Encoding", encoding)
 	copyHeader(w, "ETag", resp.ETag)
-	copyHeader(w, "Cache-Control", resp.CacheControl)
+	h.Set("Vary", "Accept-Encoding")
+	// Martin's ETag changes on every rebake, so a day is safe.
+	h.Set("Cache-Control", "public, max-age=86400")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
 		return
 	}
-	w.Write(resp.Body)
+	w.Write(body)
 }
 
 // --- Fine-detail privacy bundle ---
