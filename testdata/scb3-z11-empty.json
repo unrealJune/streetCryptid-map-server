@@ -1,0 +1,12 @@
+{
+  "request": "/planet/bundle/v3/164/357/11",
+  "stages": [
+    {
+      "zoom": 11,
+      "part": "full",
+      "payload_hex": "53434231010a0b01000000a40000016500000004ffffffffffffffffffffffffffffffff",
+      "payload_sha256": "a6163f506c5e6ad97799d5afbab0b8d3cd595b5dd0ff28b48cf6296abac15e12"
+    }
+  ],
+  "scb3_hex": "53434233030a0b00000000a40000016500000001000000240b000000a6163f506c5e6ad97799d5afbab0b8d3cd595b5dd0ff28b48cf6296abac15e1253434231010a0b01000000a40000016500000004ffffffffffffffffffffffffffffffff"
+}

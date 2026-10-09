@@ -20,7 +20,8 @@ import (
 	"time"
 )
 
-const maxObjectBytes = 2*(65*1024*1024+40) + 20
+// maxObjectBytes admits the largest stream: three SCB3 frames (SCB2 has two).
+const maxObjectBytes = 3*(65*1024*1024+40) + 20
 const maxEntries = 100000
 
 var ErrDisabled = errors.New("cache: persistence disabled")

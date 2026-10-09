@@ -53,6 +53,11 @@ type TileSource interface {
 	GetTileBytes(context.Context, privacy.TileCoord) ([]byte, error)
 }
 
+// StoredTileSource returns tiles as stored plus whether they are gzip members.
+type StoredTileSource interface {
+	GetTileStored(context.Context, privacy.TileCoord) ([]byte, bool, error)
+}
+
 // Server holds handler dependencies.
 type Server struct {
 	cfg     Config
@@ -64,6 +69,7 @@ type Server struct {
 	workers chan struct{} // global concurrency bound across all bundle builds
 	builds  chan struct{}
 	source  TileSource
+	stored  StoredTileSource // nil: v3 is unavailable (501)
 }
 
 // New wires a server. workers bounds total concurrent upstream reads.
@@ -97,6 +103,9 @@ func New(cfg Config, client *martin.Client, c *cache.Cache) *Server {
 		builds:  make(chan struct{}, cfg.BundleBuilds),
 		source:  cfg.BundleSource,
 	}
+	if stored, ok := cfg.BundleSource.(StoredTileSource); ok {
+		s.stored = stored
+	}
 	if cfg.RatePerSec > 0 {
 		s.limiter = newRateLimiter(cfg.RatePerSec, cfg.Burst, cfg.Now)
 	}
@@ -113,6 +122,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /planet/bundle/v1/{x10}/{y10}/{tileZoom}", s.handleBundle)
 	mux.HandleFunc("GET /planet/bundle/v2/{x10}/{y10}/{tileZoom}", s.handleBundleV2)
 	mux.HandleFunc("OPTIONS /planet/bundle/v2/{x10}/{y10}/{tileZoom}", s.handleBundleOptions)
+	mux.HandleFunc("GET /planet/bundle/v3/{x10}/{y10}/{tileZoom}", s.handleBundleV3)
+	mux.HandleFunc("OPTIONS /planet/bundle/v3/{x10}/{y10}/{tileZoom}", s.handleBundleOptions)
 	mux.HandleFunc("GET /planet/{z}/{x}/{y}", s.handleCoarse)
 	mux.HandleFunc("HEAD /planet/{z}/{x}/{y}", s.handleCoarse)
 	mux.HandleFunc("GET /livez", s.handleLivez)
@@ -190,15 +201,35 @@ func (s *Server) handleCoarse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.metrics.inc("mapapi_coarse_ok_total")
+	body, encoding := resp.Body, resp.ContentEncoding
+	if encoding == "gzip" {
+		s.metrics.inc("mapapi_coarse_upstream_gzip_total")
+		// Real clients accept gzip; this keeps a plain curl working.
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			body, err = resp.RawBody(16 << 20)
+			if err != nil {
+				s.metrics.inc("mapapi_coarse_error_total")
+				s.log.Warn("coarse inflate failure", "zoom", z, "err", err.Error())
+				http.Error(w, "upstream error", http.StatusBadGateway)
+				return
+			}
+			encoding = ""
+			s.metrics.inc("mapapi_coarse_inflated_total")
+		}
+	}
+	h := w.Header()
 	copyHeader(w, "Content-Type", resp.ContentType)
-	copyHeader(w, "Content-Encoding", resp.ContentEncoding)
+	copyHeader(w, "Content-Encoding", encoding)
 	copyHeader(w, "ETag", resp.ETag)
-	copyHeader(w, "Cache-Control", resp.CacheControl)
+	h.Set("Vary", "Accept-Encoding")
+	// Martin's ETag changes on every rebake, so a day is safe.
+	h.Set("Cache-Control", "public, max-age=86400")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
 		return
 	}
-	w.Write(resp.Body)
+	w.Write(body)
 }
 
 // --- Fine-detail privacy bundle ---
@@ -247,19 +278,29 @@ func (s *Server) admitted(build func() ([]byte, error)) ([]byte, error) {
 	}
 }
 
+// cachedStage reads a persisted stage. A missing or corrupt entry is a miss.
+func (s *Server) cachedStage(key string) ([]byte, bool, error) {
+	f, err := s.cache.Open(key)
+	if err == nil {
+		data, readErr := io.ReadAll(f)
+		if err := errors.Join(readErr, f.Close()); err != nil {
+			return nil, false, err
+		}
+		return data, true, nil
+	}
+	if errors.Is(err, cache.ErrCorrupt) {
+		s.log.Warn("discarded corrupt bundle stage; rebuilding", "err", err)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, false, fmt.Errorf("read bundle stage: %w", err)
+	}
+	return nil, false, nil
+}
+
 func (s *Server) stage(ctx context.Context, req privacy.BundleRequest) ([]byte, error) {
 	key := s.stageKey(req)
 	return s.cache.Do(key, func() ([]byte, error) {
-		if f, err := s.cache.Open(key); err == nil {
-			data, readErr := io.ReadAll(f)
-			if err := errors.Join(readErr, f.Close()); err != nil {
-				return nil, err
-			}
-			return data, nil
-		} else if errors.Is(err, cache.ErrCorrupt) {
-			s.log.Warn("discarded corrupt bundle stage; rebuilding", "err", err)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("read bundle stage: %w", err)
+		if data, ok, err := s.cachedStage(key); ok || err != nil {
+			return data, err
 		}
 		data, err := s.buildBundle(ctx, req)
 		if err != nil {
@@ -372,82 +413,86 @@ func (s *Server) bundleHeaders(w http.ResponseWriter, etag string, size int64) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// buildBundle fetches the complete fixed descendant set with bounded
-// concurrency, encodes deterministic SCB1, and gzips it. It never returns a
-// partial bundle: any non-empty Martin failure fails the whole build. A client
-// disconnect does not abort the build — members are shared and worth caching —
-// but it also never commits a partial cache entry because build runs to
-// completion or errors atomically.
-func (s *Server) buildBundle(reqCtx context.Context, req privacy.BundleRequest) ([]byte, error) {
+// eachTile runs fn for every tile under a two-level bound: per-request workers
+// and the global cap. The first error cancels the remaining reads and is
+// returned, so callers never see a partial descendant set.
+func (s *Server) eachTile(reqCtx context.Context, tiles []privacy.TileCoord, fn func(ctx context.Context, i int, t privacy.TileCoord) error) error {
 	ctx, cancel := context.WithCancel(reqCtx)
 	defer cancel()
-
-	tiles := req.Descendants()
-	entries := make([]scb1.Entry, len(tiles))
 
 	var (
 		wg       sync.WaitGroup
 		mu       sync.Mutex
 		firstErr error
-		total    = scb1.HeaderBytes + req.EntryCount()*4
 	)
+	fail := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if firstErr == nil {
+			firstErr = err
+			cancel() // stop the rest; the whole bundle fails
+		}
+	}
 	sem := make(chan struct{}, s.cfg.BundleWorkers)
 
 	for i, t := range tiles {
 		wg.Add(1)
-		go func(i int, t privacy.TileCoord) {
+		go func() {
 			defer wg.Done()
-			// Two-level bound: per-request workers and a global cap.
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = ctx.Err()
-				}
-				mu.Unlock()
+				fail(ctx.Err())
 				return
 			}
 			defer func() { <-sem }()
 			select {
 			case s.workers <- struct{}{}:
 			case <-ctx.Done():
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = ctx.Err()
-				}
-				mu.Unlock()
+				fail(ctx.Err())
 				return
 			}
 			defer func() { <-s.workers }()
-
-			payload, err := s.source.GetTileBytes(ctx, t)
-			mu.Lock()
-			defer mu.Unlock()
-			if err != nil {
-				if firstErr == nil {
-					firstErr = err
-					cancel() // stop the rest; the whole bundle fails
-				}
-				return
+			if err := fn(ctx, i, t); err != nil {
+				fail(err)
 			}
-			if firstErr != nil {
-				return
-			}
-			if len(payload) > scb1.MaxDecompressedBytes-total {
-				firstErr = scb1.ErrTooLarge
-				cancel()
-				return
-			}
-			total += len(payload)
-			entries[i] = scb1.Entry{Bytes: payload}
-		}(i, t)
+		}()
 	}
 	wg.Wait()
 	if firstErr != nil {
-		return nil, firstErr
+		return firstErr
 	}
-	if err := ctx.Err(); err != nil {
+	return reqCtx.Err()
+}
+
+// buildBundle fetches the complete fixed descendant set with bounded
+// concurrency, encodes deterministic SCB1, and gzips it. It never returns a
+// partial bundle: any non-empty Martin failure fails the whole build. A client
+// disconnect does not abort the build — members are shared and worth caching —
+// but it also never commits a partial cache entry because build runs to
+// completion or errors atomically.
+func (s *Server) buildBundle(ctx context.Context, req privacy.BundleRequest) ([]byte, error) {
+	tiles := req.Descendants()
+	entries := make([]scb1.Entry, len(tiles))
+	var (
+		mu    sync.Mutex
+		total = scb1.HeaderBytes + req.EntryCount()*4
+	)
+	err := s.eachTile(ctx, tiles, func(ctx context.Context, i int, t privacy.TileCoord) error {
+		payload, err := s.source.GetTileBytes(ctx, t)
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(payload) > scb1.MaxDecompressedBytes-total {
+			return scb1.ErrTooLarge
+		}
+		total += len(payload)
+		entries[i] = scb1.Entry{Bytes: payload}
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
 
@@ -465,9 +510,9 @@ func (s *Server) buildBundle(reqCtx context.Context, req privacy.BundleRequest) 
 	return gz, nil
 }
 
-func streamHeaders(w http.ResponseWriter, etag string) {
+func streamHeaders(w http.ResponseWriter, mediaType, etag string) {
 	h := w.Header()
-	h.Set("Content-Type", scb2.MediaType)
+	h.Set("Content-Type", mediaType)
 	h.Set("Cache-Control", "public, max-age=86400, no-transform")
 	h.Set("ETag", etag)
 	h.Set("Accept-Ranges", "bytes")
@@ -491,9 +536,41 @@ func (s *Server) handleBundleV2(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	key := fmt.Sprintf("%s:%s:%s:10:%d:%d:%d", scb2.CodecVersion, url.PathEscape(s.cfg.DatasetVersion), s.cfg.DatasetDigest, req.AnchorX, req.AnchorY, req.TileZoom)
+	stages := scb2.Stages(req)
+	s.serveStream(w, r, req, streamSpec{
+		key:       fmt.Sprintf("%s:%s:%s:10:%d:%d:%d", scb2.CodecVersion, url.PathEscape(s.cfg.DatasetVersion), s.cfg.DatasetDigest, req.AnchorX, req.AnchorY, req.TileZoom),
+		mediaType: scb2.MediaType,
+		header:    scb2.Header(req),
+		stages:    len(stages),
+		maxBytes:  scb2.MaxStreamBytes,
+		frame: func(ctx context.Context, i int) ([]byte, error) {
+			gz, err := s.stage(ctx, stages[i])
+			if err != nil {
+				return nil, err
+			}
+			return scb2.Frame(stages[i], gz)
+		},
+	})
+}
+
+// streamSpec describes one progressive representation: a fixed header followed
+// by frames that are built, in order, inside a single admitted build.
+type streamSpec struct {
+	key       string // persistent namespace; the quoted key is the strong ETag
+	mediaType string
+	header    []byte
+	stages    int
+	maxBytes  int
+	frame     func(ctx context.Context, i int) ([]byte, error)
+}
+
+// serveStream serves a complete cached stream with Range support, or builds it
+// once, flushing each frame to a plain GET as soon as it exists. Only a
+// complete stream enters the cache.
+func (s *Server) serveStream(w http.ResponseWriter, r *http.Request, req privacy.BundleRequest, spec streamSpec) {
+	key := spec.key
 	etag := fmt.Sprintf("%q", key)
-	streamHeaders(w, etag)
+	streamHeaders(w, spec.mediaType, etag)
 	// Only single byte ranges are supported. Ignore multi-range requests rather
 	// than emitting a multipart representation or amplifying overlapping ranges.
 	if strings.Contains(r.Header.Get("Range"), ",") {
@@ -524,21 +601,17 @@ func (s *Server) handleBundleV2(w http.ResponseWriter, r *http.Request) {
 			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), s.cfg.BundleTimeout)
 			defer cancel()
 			var out bytes.Buffer
-			out.Write(scb2.Header(req))
-			for i, stage := range scb2.Stages(req) {
-				gz, err := s.stage(ctx, stage)
-				if err != nil {
-					return nil, err
-				}
-				frame, err := scb2.Frame(stage, gz)
+			out.Write(spec.header)
+			for i := range spec.stages {
+				frame, err := spec.frame(ctx, i)
 				if err != nil {
 					return nil, err
 				}
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
-				if out.Len()+len(frame) > scb2.MaxStreamBytes {
-					return nil, errors.New("scb2: stream exceeds bound")
+				if out.Len()+len(frame) > spec.maxBytes {
+					return nil, errors.New("bundle stream exceeds bound")
 				}
 				out.Write(frame)
 				if progressive && !writeFailed {
@@ -571,7 +644,7 @@ func (s *Server) handleBundleV2(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 				}
-				// The overview is flushed above BEFORE starting the z14 build.
+				// Each frame is flushed above BEFORE the next stage is built.
 			}
 			if err := ctx.Err(); err != nil {
 				return nil, err

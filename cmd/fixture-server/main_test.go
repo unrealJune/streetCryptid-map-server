@@ -78,3 +78,32 @@ func TestFixtureRejectsPublicBind(t *testing.T) {
 		}
 	}
 }
+
+func TestFixtureServesV3Goldens(t *testing.T) {
+	dir := t.TempDir()
+	handler, cleanup, err := newFixture(dir, filepath.Join(dir, "cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	for _, z := range []int{11, 14} {
+		golden, err := os.ReadFile(filepath.Join("..", "..", "testdata", fmt.Sprintf("scb3-z%d-empty.scb3", z)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		url := fmt.Sprintf("%s/planet/bundle/v3/164/357/%d", server.URL, z)
+		for range 2 {
+			resp, err := http.Get(url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil || resp.StatusCode != 200 || !bytes.Equal(body, golden) {
+				t.Fatalf("z%d golden mismatch: %d %v", z, resp.StatusCode, err)
+			}
+		}
+	}
+}

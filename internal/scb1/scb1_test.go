@@ -75,3 +75,39 @@ func TestSizeRejectsOversized(t *testing.T) {
 		t.Fatalf("want ErrTooLarge, got %v", err)
 	}
 }
+
+func TestGzipEntriesFlag(t *testing.T) {
+	req, _ := privacy.ValidateBundle(164, 357, 11)
+	member := []byte{0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0xff, 3, 0, 0, 0, 0, 0, 0, 0}
+	entries := []Entry{{Bytes: member}, {}, {Bytes: member}, {}}
+	raw, err := EncodeFlags(req, FlagGzipEntries, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[7] != FlagGzipEntries {
+		t.Fatalf("flags byte %d", raw[7])
+	}
+	if err := ValidateFlags(req, raw, FlagGzipEntries); err != nil {
+		t.Fatal(err)
+	}
+	if Validate(req, raw) == nil {
+		t.Fatal("flagged body accepted as flags 0")
+	}
+	plain, _ := Encode(req, entries)
+	if ValidateFlags(req, plain, FlagGzipEntries) == nil {
+		t.Fatal("flags 0 body accepted as gzip entries")
+	}
+	for name, bad := range map[string][]byte{
+		"raw mvt":     {0x1a, 0x02, 0x0a, 0x00},
+		"short":       member[:17],
+		"not deflate": append([]byte{0x1f, 0x8b, 0x09}, member[3:]...),
+	} {
+		raw, err := EncodeFlags(req, FlagGzipEntries, []Entry{{}, {Bytes: bad}, {}, {}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ValidateFlags(req, raw, FlagGzipEntries) == nil {
+			t.Fatalf("%s entry accepted", name)
+		}
+	}
+}

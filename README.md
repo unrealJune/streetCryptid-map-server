@@ -33,10 +33,11 @@ Ingress / Service (only :8080)
 
 | Method | Path | Zoom | Behavior |
 | ------ | ---- | ---- | -------- |
-| `GET`/`HEAD` | `/planet/{z}/{x}/{y}` | 0–10 | Proxies Martin MVT bytes. |
+| `GET`/`HEAD` | `/planet/{z}/{x}/{y}` | 0–10 | Proxies Martin MVT bytes, gzip-encoded as stored when the client accepts gzip (inflated otherwise); `Cache-Control: public, max-age=86400`, `Vary: Accept-Encoding`. |
 | `GET`/`HEAD` | `/planet/{z}/{x}/{y}` | 11–14 | **404 without contacting Martin.** |
 | `GET` | `/planet/bundle/v1/{x10}/{y10}/{tileZoom}` | 11–14 | Returns the complete descendant set as one SCB1 bundle. |
 | `GET`/`HEAD` | `/planet/bundle/v2/{x10}/{y10}/{tileZoom}` | 11–14 | Progressive SCB2 stages; complete cached representations support byte ranges. |
+| `GET`/`HEAD` | `/planet/bundle/v3/{x10}/{y10}/{tileZoom}` | 11–14 | Progressive SCB3: per-tile gzip entries, z14 split into structure and labels stages; byte ranges as v2. |
 | `GET` | `/livez` `/readyz` `/metrics` | — | Health + Prometheus metrics (metrics is cluster-internal). |
 
 A z`N` bundle contains every descendant under the fixed z10 anchor:
@@ -150,6 +151,68 @@ live HTTP bytes, SQLite close/reopen prefix resumes, 206, matching end-offset
 It uses host Bun fetch, SHA-256 and SQLite adapters, not the device-native
 Expo implementations. No Bun dependencies are added to the Go server.
 
+### Progressive SCB3
+
+V3 is served alongside v1 and v2, which keep working unchanged. It shares
+v2's request validation (fixed z10 anchor and requested zoom; no query string
+or body), its response headers (`Cache-Control: public, max-age=86400,
+no-transform`, strong ETag, `Accept-Ranges: bytes`, CORS, `X-Accel-Buffering:
+no`), its Range / If-Range / 416 behaviour, progressive flushing, build
+admission and "only a complete stream is cached" rule. The media type is
+`application/vnd.streetcryptid.tile-stream3`.
+
+Two things differ. There is **no gzip around a stage**: each tile entry is its
+own gzip member, copied byte for byte from the PMTiles archive (an uncompressed
+archive is gzipped per tile), so the app inflates only the tiles it draws. And
+the **z14 stage is split by MVT layer** into a `structure` stage and a `labels`
+stage, so streets and buildings arrive before house numbers and POIs. Both
+stages still contain every descendant in the same row-major order; the split
+changes what is inside an entry, never which entries exist. A tile is a
+protobuf whose only field is `repeated Layer layers = 3`, so concatenating the
+inflated structure and labels entries gives back a tile with every layer.
+
+| Header offset | Bytes | Value |
+| --- | --- | --- |
+| 0 | 4 | ASCII `SCB3` |
+| 4 | 1 | Version `3` |
+| 5 | 1 | Anchor zoom `10` |
+| 6 | 1 | Requested tile zoom (11–14) |
+| 7 | 1 | Reserved `0` |
+| 8 | 4 | Anchor x10 |
+| 12 | 4 | Anchor y10 |
+| 16 | 4 | Stage count |
+
+| Requested zoom | Stages, in order (zoom, part) |
+| --- | --- |
+| 11, 12, 13 | (z, 0 full) |
+| 14 | (13, 0 full), (14, 1 structure), (14, 2 labels) |
+
+Part `0` is every layer, `1` every layer not in the label set, `2` only the
+label set. The label set is the constant `{housenumber, poi}`
+(`mvt.LabelLayers`); changing it requires a new `scb3.CodecVersion`.
+
+Each frame has a 40-byte prefix: payload length (4 bytes), stage zoom (1),
+part (1), reserved `0` (2), SHA-256 of the payload (32). The payload follows
+as-is. It is an SCB1 body with flags byte `0x01` (every non-empty entry is one
+complete gzip member, starting `1f 8b 08`; an entry inflates to at most
+16 MiB). A part with no layers, or a tile empty upstream, is the empty
+sentinel. Payloads are capped at 64 MiB and the stream at
+`3 * (64 MiB + 40) + 20` bytes.
+
+On a cold z14 GET the header and z13 frame are flushed before z14 is read,
+then the structure frame, then the labels frame. Both z14 parts come from one
+pass over the 256 tiles and are cached as separate stages. The ETag/cache
+namespace includes `v3-scb1gz-go1.26-r1`; recompressed entries use Go's
+default gzip level with no name or timestamp, so they are deterministic for a
+Go version. `mapapi_bundle_v3_total` counts v3 requests.
+
+Fixtures for **10/164/357** with every descendant empty:
+`testdata/scb3-z11-empty.scb3` (one stage) and `testdata/scb3-z14-empty.scb3`
+(three stages), with `.json` companions holding each stage payload and its
+SHA-256 as hex. The fixture server returns them byte for byte; the golden test
+regenerates them only with `UPDATE_SCB3_FIXTURE=1`. `scripts/bundle-stat.py`
+reports stage, tile and per-layer sizes for any SCB2 or SCB3 stream.
+
 ### Persistent cache and bounded builds
 
 The default cache budget is **4 GiB of representation payloads**, on a **6 GiB
@@ -170,7 +233,9 @@ has a 100,000-entry cap to bound tiny-file overhead.
 
 V1 and v2 reuse complete gzipped SCB1 stage caches; complete SCB2 files also
 include the stage bytes so cache-hit transfers and ranges need only one file.
-Both copies count toward the same LRU budget. Oversized individual cache objects
+V3 caches its own stages (gzip-entry SCB1; the z14 structure and labels parts
+as two) and complete SCB3 files the same way. All copies count toward the same
+LRU budget. Oversized individual cache objects
 and explicitly disabled persistence still allow uncached responses.
 
 `BUNDLE_MAX_BUILDS` defaults to **1**, bounding whole-build working sets across
@@ -304,6 +369,8 @@ cmd/server            process, config, subcommands, graceful shutdown
 internal/privacy      compile-time boundary, XYZ validation, descendant math
 internal/scb1         strict SCB1 encoder + size accounting
 internal/scb2         progressive framing + raw stage integrity + golden fixture
+internal/scb3         SCB3 framing (gzip-entry stages, z14 layer split) + golden fixtures
+internal/mvt          MVT layer split (structure / labels) without re-encoding
 internal/pmtiles      bounded direct PMTiles v3 file reader + directory LRU
 internal/martin       bounded localhost Martin client
 internal/cache        disk LRU bundle cache + in-flight dedup
@@ -311,4 +378,5 @@ internal/httpapi      routes, coarse + bundle handlers, health, metrics, limits
 internal/tilesync     signed manifest, resumable download, releases, updater, k8s patch
 helm/                 chart (API + private Martin + bootstrap + updater)
 scripts/              bake / publish / verify (workstation/CI)
+scripts/bundle-stat.py  stage / tile / layer size report for SCB2 and SCB3 streams
 ```
