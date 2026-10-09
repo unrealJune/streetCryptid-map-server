@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/binary"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -123,11 +124,32 @@ func TestArchiveRootLeafRLECompression(t *testing.T) {
 					if err != nil || string(got) != want {
 						t.Fatalf("leaf=%v comp=%d tileComp=%d i=%d got=%q err=%v", useLeaf, comp, tileComp, i, got, err)
 					}
+					stored, gzipped, err := r.GetTileStored(context.Background(), tc)
+					if err != nil || gzipped != (tileComp == 2 && want != "") {
+						t.Fatalf("stored leaf=%v comp=%d tileComp=%d i=%d gzipped=%v err=%v", useLeaf, comp, tileComp, i, gzipped, err)
+					}
+					wantStored := map[string][]byte{"abc": a, "defg": b, "": nil}[want]
+					if !bytes.Equal(stored, wantStored) || (want == "") != (stored == nil) {
+						t.Fatalf("stored bytes leaf=%v tileComp=%d i=%d: %x", useLeaf, tileComp, i, stored)
+					}
+					if gzipped {
+						zr, err := gzip.NewReader(bytes.NewReader(stored))
+						if err != nil {
+							t.Fatal(err)
+						}
+						inflated, err := io.ReadAll(zr)
+						if err != nil || string(inflated) != want {
+							t.Fatalf("stored gzip inflates to %q, want %q (%v)", inflated, want, err)
+						}
+					}
 				}
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
 				if _, err := r.GetTileBytes(ctx, privacy.TileCoord{Z: 1}); err == nil {
 					t.Fatal("ignored cancellation")
+				}
+				if _, _, err := r.GetTileStored(ctx, privacy.TileCoord{Z: 1}); err == nil {
+					t.Fatal("stored read ignored cancellation")
 				}
 				r.Close()
 			}

@@ -88,6 +88,7 @@ func run(ctx context.Context, addr, cacheDir string) error {
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	fmt.Printf("SCB2 fixture http://%s/planet/bundle/v2/164/357/11\n", listener.Addr())
+	fmt.Printf("SCB3 fixture http://%s/planet/bundle/v3/164/357/11\n", listener.Addr())
 	fmt.Printf("cache=%s; all fine tiles empty; production handler, PMTiles reader and cache\n", cacheDir)
 	select {
 	case err := <-done:

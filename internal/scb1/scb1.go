@@ -26,6 +26,11 @@ const (
 	// MaxDecompressedBytes bounds the assembled (pre-gzip) body at 64 MiB. It
 	// mirrors TILE_BUNDLE_MAX_BYTES on the app side.
 	MaxDecompressedBytes = 64 * 1024 * 1024
+	// FlagGzipEntries marks a body whose every non-empty entry is one complete
+	// gzip member (SCB3 payloads). Flags 0 means raw MVT entries.
+	FlagGzipEntries = 0x01
+	// minGzipMember is a gzip header plus trailer around an empty deflate body.
+	minGzipMember = 18
 )
 
 // Entry is one descendant's payload. Bytes is nil for a known-empty tile.
@@ -53,11 +58,16 @@ func Size(entries []Entry) (int, error) {
 	return total, nil
 }
 
-// Encode serializes a complete bundle for req. len(entries) must equal the
+// Encode serializes a complete raw-entry bundle (flags 0) for req.
+func Encode(req privacy.BundleRequest, entries []Entry) ([]byte, error) {
+	return EncodeFlags(req, 0, entries)
+}
+
+// EncodeFlags serializes a complete bundle for req. len(entries) must equal the
 // request's descendant count; entries are in the request's row-major order.
 // A nil Entry.Bytes is written as the empty sentinel. The returned buffer is
 // the uncompressed SCB1 body; callers gzip it for the wire.
-func Encode(req privacy.BundleRequest, entries []Entry) ([]byte, error) {
+func EncodeFlags(req privacy.BundleRequest, flags byte, entries []Entry) ([]byte, error) {
 	want := req.EntryCount()
 	if len(entries) != want {
 		return nil, fmt.Errorf("scb1: expected %d entries, got %d", want, len(entries))
@@ -72,7 +82,7 @@ func Encode(req privacy.BundleRequest, entries []Entry) ([]byte, error) {
 	buf[4] = Version
 	buf[5] = privacy.PrivacyAnchorZoom
 	buf[6] = byte(req.TileZoom)
-	buf[7] = 0 // flags
+	buf[7] = flags
 	binary.BigEndian.PutUint32(buf[8:12], uint32(req.AnchorX))
 	binary.BigEndian.PutUint32(buf[12:16], uint32(req.AnchorY))
 	binary.BigEndian.PutUint32(buf[16:20], uint32(want))
@@ -91,14 +101,21 @@ func Encode(req privacy.BundleRequest, entries []Entry) ([]byte, error) {
 	return buf, nil
 }
 
-// Validate checks the exact requested header, complete row-major descendant
-// count, length bounds and absence of trailing bytes without copying payloads.
+// Validate checks a raw-entry (flags 0) body; see ValidateFlags.
 func Validate(req privacy.BundleRequest, raw []byte) error {
+	return ValidateFlags(req, raw, 0)
+}
+
+// ValidateFlags checks the exact requested header and flags, complete
+// row-major descendant count, length bounds and absence of trailing bytes
+// without copying payloads. With FlagGzipEntries every non-empty entry must
+// look like a gzip member; entries are not inflated here.
+func ValidateFlags(req privacy.BundleRequest, raw []byte, flags byte) error {
 	if len(raw) < HeaderBytes || len(raw) > MaxDecompressedBytes {
 		return fmt.Errorf("scb1: invalid size")
 	}
 	if string(raw[:4]) != Magic || raw[4] != Version ||
-		raw[5] != privacy.PrivacyAnchorZoom || raw[6] != byte(req.TileZoom) || raw[7] != 0 ||
+		raw[5] != privacy.PrivacyAnchorZoom || raw[6] != byte(req.TileZoom) || raw[7] != flags ||
 		binary.BigEndian.Uint32(raw[8:]) != uint32(req.AnchorX) ||
 		binary.BigEndian.Uint32(raw[12:]) != uint32(req.AnchorY) ||
 		binary.BigEndian.Uint32(raw[16:]) != uint32(req.EntryCount()) {
@@ -116,6 +133,12 @@ func Validate(req privacy.BundleRequest, raw []byte) error {
 		}
 		if uint64(n) > uint64(len(raw)-offset) {
 			return fmt.Errorf("scb1: truncated descendant")
+		}
+		if flags&FlagGzipEntries != 0 {
+			e := raw[offset : offset+int(n)]
+			if len(e) < minGzipMember || e[0] != 0x1f || e[1] != 0x8b || e[2] != 0x08 {
+				return fmt.Errorf("scb1: entry is not a gzip member")
+			}
 		}
 		offset += int(n)
 	}

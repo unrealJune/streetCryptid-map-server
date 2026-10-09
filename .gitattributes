@@ -6,3 +6,5 @@
 *.png binary
 *.pmtiles binary
 *.golden text eol=lf
+*.scb2 binary
+*.scb3 binary

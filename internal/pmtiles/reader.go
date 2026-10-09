@@ -257,36 +257,28 @@ func (r *Reader) directory(s section) ([]entry, error) {
 	return entries, nil
 }
 
-func (r *Reader) GetTileBytes(ctx context.Context, t privacy.TileCoord) ([]byte, error) {
+// lookup walks the directories to the entry holding t. found is false for a
+// tile the archive does not contain.
+func (r *Reader) lookup(ctx context.Context, t privacy.TileCoord) (e entry, found bool, err error) {
 	id, err := TileID(t)
 	if err != nil {
-		return nil, err
+		return entry{}, false, err
 	}
 	entries := r.root
 	for depth := 0; depth < maxDepth; depth++ {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return entry{}, false, err
 		}
 		i := sort.Search(len(entries), func(i int) bool { return entries[i].id > id }) - 1
 		if i < 0 {
-			return nil, nil
+			return entry{}, false, nil
 		}
 		e := entries[i]
 		if e.run != 0 {
 			if id-e.id >= e.run {
-				return nil, nil
+				return entry{}, false, nil
 			}
-			raw, err := r.read(section{r.tiles.offset + e.offset, e.length}, r.tileCompression, maxTileBytes)
-			if err != nil {
-				return nil, err
-			}
-			if err := ctx.Err(); err != nil {
-				return nil, err
-			}
-			if len(raw) == 0 {
-				return nil, nil
-			}
-			return raw, nil
+			return e, true, nil
 		}
 		end := ^uint64(0)
 		if i+1 < len(entries) {
@@ -294,12 +286,49 @@ func (r *Reader) GetTileBytes(ctx context.Context, t privacy.TileCoord) ([]byte,
 		}
 		entries, err = r.directory(section{e.offset, e.length})
 		if err != nil {
-			return nil, err
+			return entry{}, false, err
 		}
 		last := entries[len(entries)-1]
 		if entries[0].id != e.id || last.id >= end || last.run > end-last.id {
-			return nil, errors.New("pmtiles: leaf IDs outside parent interval")
+			return entry{}, false, errors.New("pmtiles: leaf IDs outside parent interval")
 		}
 	}
-	return nil, errors.New("pmtiles: directory depth exceeds bound (possible cycle)")
+	return entry{}, false, errors.New("pmtiles: directory depth exceeds bound (possible cycle)")
+}
+
+// GetTileBytes returns the decoded MVT bytes for t, or nil for an empty tile.
+func (r *Reader) GetTileBytes(ctx context.Context, t privacy.TileCoord) ([]byte, error) {
+	e, found, err := r.lookup(ctx, t)
+	if err != nil || !found {
+		return nil, err
+	}
+	raw, err := r.read(section{r.tiles.offset + e.offset, e.length}, r.tileCompression, maxTileBytes)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	return raw, nil
+}
+
+// GetTileStored returns the tile bytes exactly as stored in the archive and
+// whether they are a gzip member (tile compression 2). (nil, false, nil) is an
+// empty tile. Stored size is bounded by maxTileBytes.
+func (r *Reader) GetTileStored(ctx context.Context, t privacy.TileCoord) ([]byte, bool, error) {
+	e, found, err := r.lookup(ctx, t)
+	if err != nil || !found {
+		return nil, false, err
+	}
+	stored, err := r.read(section{r.tiles.offset + e.offset, e.length}, 1, maxTileBytes)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	return stored, r.tileCompression == 2, nil
 }
