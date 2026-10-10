@@ -61,3 +61,30 @@ jobs:
             echo "schema accepted disablePrivacy"; exit 1
           fi
           echo "OK: disablePrivacy rejected by schema"
+
+  # The terrain bake against the real public DEM, on one 1-degree cell (Kyoto),
+  # then installed with the server's own import so the Go reader proves it can
+  # serve what Python wrote. Keeps the year-scale bake from breaking silently.
+  terrain-bake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+      - name: build the bake image
+        run: docker build -t terrain-bake terrain
+      - name: bake one cell
+        run: |
+          mkdir -p "$RUNNER_TEMP/bake"
+          docker run --rm --user "$(id -u):$(id -g)" -v "$RUNNER_TEMP/bake:/work" terrain-bake \
+            --output /work/terrain.pmtiles --workdir /work/wd \
+            --bbox 135.2,34.8,135.8,35.2 --max-zoom 11 --workers 2
+          ls -la "$RUNNER_TEMP/bake"
+      - name: import with the server
+        run: |
+          mkdir -p "$RUNNER_TEMP/data"
+          TILE_DATA_DIR="$RUNNER_TEMP/data" go run ./cmd/server tiles import-terrain \
+            "$RUNNER_TEMP/bake/terrain.pmtiles" ci-smoke
+          test -s "$RUNNER_TEMP/data/terrain/terrain.pmtiles"

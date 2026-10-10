@@ -96,6 +96,31 @@
               }
             }
           }
+        },
+        "terrainBake": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "suspend": { "type": "boolean" },
+            "schedule": { "type": "string" },
+            "nodeName": { "type": "string" },
+            "workers": { "type": "integer", "minimum": 1 },
+            "maxZoom": { "type": "integer", "minimum": 1, "maximum": 12 },
+            "bbox": {
+              "type": "string",
+              "pattern": "^$|^-?[0-9.]+,-?[0-9.]+,-?[0-9.]+,-?[0-9.]+$"
+            },
+            "version": { "type": "string" },
+            "backoffLimit": { "type": "integer", "minimum": 0 },
+            "activeDeadlineSeconds": { "type": "integer", "minimum": 3600 },
+            "scratch": {
+              "type": "object",
+              "properties": {
+                "size": { "type": "string" },
+                "storageClass": { "type": "string" }
+              }
+            }
+          }
         }
       },
       "allOf": [

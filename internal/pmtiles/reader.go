@@ -1,4 +1,5 @@
-// Package pmtiles implements bounded local PMTiles v3 MVT reads. Compression
+// Package pmtiles implements bounded local PMTiles v3 reads: MVT for the planet
+// (Open) and PNG/WebP rasters for the terrain DEM (OpenRaster). Compression
 // modes other than none/gzip fail explicitly; they never become empty tiles.
 package pmtiles
 
@@ -15,6 +16,13 @@ import (
 	"sync"
 
 	"github.com/junephilip/streetcryptid-map-server/internal/privacy"
+)
+
+// PMTiles v3 tile types (header byte 99).
+const (
+	TileTypeMVT  byte = 1
+	TileTypePNG  byte = 2
+	TileTypeWebP byte = 4
 )
 
 const (
@@ -38,18 +46,32 @@ type Reader struct {
 	root                                 []entry
 	leaves, tiles                        section
 	internalCompression, tileCompression byte
+	tileType                             byte
+	maxZoom                              int
 	mu                                   sync.Mutex
 	directories                          map[section]*leaf
 	clock                                uint64
 	cacheBytes                           int
 }
 
+// Open opens an MVT archive (the planet).
 func Open(path string) (*Reader, error) {
+	return open(path, false)
+}
+
+// OpenRaster opens a PNG or WebP archive (the terrain DEM). Raster tiles are
+// already compressed, so the archive's tile compression must be none — or
+// "unknown", which raster writers commonly emit and which means the same here.
+func OpenRaster(path string) (*Reader, error) {
+	return open(path, true)
+}
+
+func open(path string, raster bool) (*Reader, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	r, err := openFile(f)
+	r, err := openFile(f, raster)
 	if err != nil {
 		f.Close()
 		return nil, err
@@ -57,7 +79,7 @@ func Open(path string) (*Reader, error) {
 	return r, nil
 }
 
-func openFile(f *os.File) (*Reader, error) {
+func openFile(f *os.File, raster bool) (*Reader, error) {
 	fi, err := f.Stat()
 	if err != nil {
 		return nil, err
@@ -69,10 +91,20 @@ func openFile(f *os.File) (*Reader, error) {
 	if string(h[:7]) != "PMTiles" || h[7] != 3 {
 		return nil, errors.New("pmtiles: expected v3 archive")
 	}
+	if raster && h[98] == 0 {
+		h[98] = 1
+	}
 	if (h[97] != 1 && h[97] != 2) || (h[98] != 1 && h[98] != 2) {
 		return nil, fmt.Errorf("pmtiles: unsupported compression internal=%d tile=%d", h[97], h[98])
 	}
-	if h[99] != 1 || h[100] > h[101] || h[101] > 31 {
+	if raster {
+		if (h[99] != TileTypePNG && h[99] != TileTypeWebP) || h[98] != 1 {
+			return nil, errors.New("pmtiles: expected an uncompressed PNG or WebP archive")
+		}
+	} else if h[99] != TileTypeMVT {
+		return nil, errors.New("pmtiles: invalid MVT type or zoom range")
+	}
+	if h[100] > h[101] || h[101] > 31 {
 		return nil, errors.New("pmtiles: invalid MVT type or zoom range")
 	}
 	sections := make([]section, 4)
@@ -93,7 +125,7 @@ func openFile(f *os.File) (*Reader, error) {
 	if sections[0].length == 0 || sections[0].offset+sections[0].length > 16384 {
 		return nil, errors.New("pmtiles: invalid root extent")
 	}
-	r := &Reader{file: f, leaves: sections[2], tiles: sections[3], internalCompression: h[97], tileCompression: h[98], directories: make(map[section]*leaf)}
+	r := &Reader{file: f, leaves: sections[2], tiles: sections[3], internalCompression: h[97], tileCompression: h[98], tileType: h[99], maxZoom: int(h[101]), directories: make(map[section]*leaf)}
 	raw, err := r.read(sections[0], h[97], maxDirectoryBytes)
 	if err != nil {
 		return nil, err
@@ -106,6 +138,12 @@ func openFile(f *os.File) (*Reader, error) {
 }
 
 func (r *Reader) Close() error { return r.file.Close() }
+
+// TileType is the archive's PMTiles tile type (TileTypeMVT, TileTypePNG, TileTypeWebP).
+func (r *Reader) TileType() byte { return r.tileType }
+
+// MaxZoom is the deepest zoom the archive declares.
+func (r *Reader) MaxZoom() int { return r.maxZoom }
 
 func (r *Reader) read(s section, compression byte, limit int64) ([]byte, error) {
 	if s.length == 0 || s.length > uint64(limit)+(1<<20) {

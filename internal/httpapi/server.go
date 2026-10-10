@@ -41,6 +41,8 @@ type Config struct {
 	BundleTimeout    time.Duration
 	BundleBuilds     int // concurrent complete builds, not individual tile reads
 	BundleSource     TileSource
+	// Terrain is the optional DEM; nil answers 404 on every /terrain route.
+	Terrain *Terrain
 	// RatePerSec/Burst tune the per-client token bucket. Zero disables limits.
 	RatePerSec float64
 	Burst      float64
@@ -124,6 +126,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("OPTIONS /planet/bundle/v2/{x10}/{y10}/{tileZoom}", s.handleBundleOptions)
 	mux.HandleFunc("GET /planet/bundle/v3/{x10}/{y10}/{tileZoom}", s.handleBundleV3)
 	mux.HandleFunc("OPTIONS /planet/bundle/v3/{x10}/{y10}/{tileZoom}", s.handleBundleOptions)
+	mux.HandleFunc("GET /terrain/bundle/v1/{x10}/{y10}/{tileZoom}", s.handleTerrainBundle)
+	mux.HandleFunc("GET /terrain/{z}/{x}/{y}", s.handleTerrainCoarse)
+	mux.HandleFunc("HEAD /terrain/{z}/{x}/{y}", s.handleTerrainCoarse)
 	mux.HandleFunc("GET /planet/{z}/{x}/{y}", s.handleCoarse)
 	mux.HandleFunc("HEAD /planet/{z}/{x}/{y}", s.handleCoarse)
 	mux.HandleFunc("GET /livez", s.handleLivez)

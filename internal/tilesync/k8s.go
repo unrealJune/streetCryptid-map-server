@@ -18,6 +18,9 @@ import (
 // Kubernetes recreate the pod with a fresh init container.
 const PendingAnnotation = "streetcryptid.io/pending-tiles-version"
 
+// TerrainAnnotation is the pod-template annotation a terrain import patches.
+const TerrainAnnotation = "streetcryptid.io/terrain-version"
+
 const svcAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 
 // KubeClient is a minimal in-cluster REST client. It uses only the projected
@@ -74,6 +77,16 @@ func (k *KubeClient) Namespace() string { return k.namespace }
 // pod-template annotation. The updater's Role grants get/patch on exactly this
 // resource name, so the same call fails by RBAC on any other Deployment.
 func (k *KubeClient) PatchDeploymentPendingVersion(ctx context.Context, namespace, name, version string) error {
+	return k.patchTemplateAnnotation(ctx, namespace, name, PendingAnnotation, version)
+}
+
+// PatchDeploymentTerrainVersion recreates the pod onto a newly imported terrain
+// archive. Its own annotation, so a terrain import never names a planet release.
+func (k *KubeClient) PatchDeploymentTerrainVersion(ctx context.Context, namespace, name, version string) error {
+	return k.patchTemplateAnnotation(ctx, namespace, name, TerrainAnnotation, version)
+}
+
+func (k *KubeClient) patchTemplateAnnotation(ctx context.Context, namespace, name, key, value string) error {
 	if namespace == "" {
 		namespace = k.namespace
 	}
@@ -82,7 +95,7 @@ func (k *KubeClient) PatchDeploymentPendingVersion(ctx context.Context, namespac
 			"template": map[string]any{
 				"metadata": map[string]any{
 					"annotations": map[string]string{
-						PendingAnnotation: version,
+						key: value,
 					},
 				},
 			},

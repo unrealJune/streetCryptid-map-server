@@ -288,3 +288,43 @@ func TestLeafCycleFails(t *testing.T) {
 		t.Fatal("cycle accepted")
 	}
 }
+
+func TestOpenRasterAcceptsOnlyUncompressedImages(t *testing.T) {
+	open := func(tileType, tileComp byte) error {
+		b := archiveBytes(t, []entry{{id: 1, run: 1, length: 4}}, []byte("RIFF"), 1, tileComp, false)
+		b[99] = tileType
+		path := filepath.Join(t.TempDir(), "terrain.pmtiles")
+		if err := os.WriteFile(path, b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		r, err := OpenRaster(path)
+		if err == nil {
+			defer r.Close()
+			if r.TileType() != tileType || r.MaxZoom() != 14 {
+				t.Fatalf("type %d maxZoom %d", r.TileType(), r.MaxZoom())
+			}
+			got, err := r.GetTileBytes(context.Background(), privacy.TileCoord{Z: 1})
+			if err != nil || string(got) != "RIFF" {
+				t.Fatalf("raster tile %q %v", got, err)
+			}
+		}
+		return err
+	}
+	for _, ok := range []struct{ tileType, comp byte }{{TileTypeWebP, 1}, {TileTypePNG, 1}, {TileTypeWebP, 0}} {
+		if err := open(ok.tileType, ok.comp); err != nil {
+			t.Fatalf("type %d comp %d rejected: %v", ok.tileType, ok.comp, err)
+		}
+	}
+	for _, bad := range []struct{ tileType, comp byte }{{TileTypeMVT, 1}, {TileTypeWebP, 2}, {3, 1}} {
+		if err := open(bad.tileType, bad.comp); err == nil {
+			t.Fatalf("type %d comp %d accepted", bad.tileType, bad.comp)
+		}
+	}
+	// And the planet path still refuses a raster archive.
+	b := archiveBytes(t, []entry{{id: 1, run: 1, length: 4}}, []byte("RIFF"), 1, 1, false)
+	b[99] = TileTypeWebP
+	if r, err := openArchive(t, b); err == nil {
+		r.Close()
+		t.Fatal("Open accepted a raster archive")
+	}
+}

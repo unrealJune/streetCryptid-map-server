@@ -1,0 +1,6 @@
+# Pinned: the bake runs for a day; a dependency bump must be a decision.
+rasterio==1.4.3
+numpy==2.2.6
+pillow==11.3.0
+mercantile==1.2.1
+pmtiles==3.4.1

@@ -31,7 +31,9 @@ import (
 func main() {
 	listen := flag.String("listen", "127.0.0.1:8089", "loopback address")
 	cacheDir := flag.String("cache-dir", "", "optional persistent fixture cache directory")
+	terrain := flag.String("terrain", "", "optional terrain.pmtiles (a bake_terrain.py output) to serve at /terrain")
 	flag.Parse()
+	terrainPath = *terrain
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := run(ctx, *listen, *cacheDir); err != nil {
@@ -39,6 +41,9 @@ func main() {
 		os.Exit(1)
 	}
 }
+
+// terrainPath is the optional -terrain archive; set once from the flags.
+var terrainPath string
 
 func loopbackAddress(addr string) error {
 	host, _, err := net.SplitHostPort(addr)
@@ -141,14 +146,34 @@ func newFixture(work, cacheDir string) (http.Handler, func(), error) {
 	}))
 	digest := sha256.Sum256(archive)
 	client := martin.New(martin.Config{BaseURL: upstream.URL + "/planet"})
+	var terrain *httpapi.Terrain
+	var terrainReader *pmtiles.Reader
+	if terrainPath != "" {
+		terrainReader, err = pmtiles.OpenRaster(terrainPath)
+		if err != nil {
+			reader.Close()
+			upstream.Close()
+			return nil, nil, fmt.Errorf("terrain: %w", err)
+		}
+		contentType := "image/webp"
+		if terrainReader.TileType() == pmtiles.TileTypePNG {
+			contentType = "image/png"
+		}
+		terrain = &httpapi.Terrain{Source: terrainReader, ContentType: contentType, Version: "fixture", MaxZoom: terrainReader.MaxZoom()}
+		fmt.Printf("terrain http://<listen>/terrain/{z}/{x}/{y} from %s\n", terrainPath)
+	}
 	s := httpapi.New(httpapi.Config{
 		Source:           "planet",
 		MartinCatalogURL: upstream.URL + "/catalog",
 		DatasetVersion:   "fixture-empty-v1",
 		DatasetDigest:    hex.EncodeToString(digest[:]),
 		BundleSource:     reader,
+		Terrain:          terrain,
 	}, client, c)
 	return s.Handler(), func() {
+		if terrainReader != nil {
+			terrainReader.Close()
+		}
 		upstream.Close()
 		if err := reader.Close(); err != nil {
 			slog.Error("fixture reader close failed", "err", err)
