@@ -168,6 +168,47 @@ tiles:
         cpu: "1"
         memory: 1Gi
 
+  # --- Terrain bake (the /terrain DEM) ---------------------------------------
+  # Bakes Copernicus GLO-30 (GLO-90 where 30 m is withheld) into Terrarium WebP
+  # tiles, z0-12, and installs them at <dataDir>/terrain/terrain.pmtiles. The
+  # app shades parkland from it; without it /terrain answers 404 and parks draw
+  # flat. Reads the public COGs in place over HTTPS (~0.5 TB over the run), and
+  # is resumable: a retried or re-run Job continues from the scratch volume.
+  # The output is tens of GB — size persistence.tiles.size for it.
+  terrainBake:
+    enabled: false
+    image:
+      repository: ghcr.io/unrealjune/streetcryptid-terrain-bake
+      tag: ""          # defaults to .Chart.AppVersion
+      pullPolicy: IfNotPresent
+    suspend: true
+    schedule: "0 4 1 1 *"   # yearly (only if suspend=false); the DEM rarely changes
+    nodeName: delphinium
+    workers: 6
+    maxZoom: 12             # 1..12; the server refuses deeper terrain
+    bbox: ""                # "west,south,east,north" for a regional bake
+    version: ""             # release label; defaults to the import time
+    backoffLimit: 6
+    activeDeadlineSeconds: 432000   # 5 days
+    priorityClassName: ""
+    resources:
+      requests:
+        cpu: "2"
+        memory: 4Gi
+      limits:
+        cpu: "6"
+        memory: 16Gi
+    scratch:
+      size: 250Gi
+      storageClass: longhorn-local
+    importResources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: "1"
+        memory: 1Gi
+
 # --- Storage ----------------------------------------------------------------
 persistence:
   tiles:

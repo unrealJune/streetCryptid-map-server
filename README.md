@@ -38,6 +38,8 @@ Ingress / Service (only :8080)
 | `GET` | `/planet/bundle/v1/{x10}/{y10}/{tileZoom}` | 11–14 | Returns the complete descendant set as one SCB1 bundle. |
 | `GET`/`HEAD` | `/planet/bundle/v2/{x10}/{y10}/{tileZoom}` | 11–14 | Progressive SCB2 stages; complete cached representations support byte ranges. |
 | `GET`/`HEAD` | `/planet/bundle/v3/{x10}/{y10}/{tileZoom}` | 11–14 | Progressive SCB3: per-tile gzip entries, z14 split into structure and labels stages; byte ranges as v2. |
+| `GET`/`HEAD` | `/terrain/{z}/{x}/{y}` | 0–10 | One Terrarium WebP DEM tile (204 over open sea). **404 above z10**, and on every terrain route when no terrain archive is installed. |
+| `GET` | `/terrain/bundle/v1/{x10}/{y10}/{tileZoom}` | 11–12 | Every DEM tile under the z10 anchor as one SCB1 bundle (raw entries, each an image). |
 | `GET` | `/livez` `/readyz` `/metrics` | — | Health + Prometheus metrics (metrics is cluster-internal). |
 
 A z`N` bundle contains every descendant under the fixed z10 anchor:
@@ -310,6 +312,47 @@ helm upgrade --install maps helm/streetcryptid-map-server \
 kubectl create job maps-bake-now --from=cronjob/maps-streetcryptid-map-server-bake
 ```
 
+### Terrain (the /terrain DEM)
+
+The app shades parkland from elevation — hillshade, dotted contours, a treeline.
+That elevation is the Copernicus DEM GLO-30 (GLO-90 where the 30 m product is
+withheld), baked by `terrain/bake_terrain.py` into **Terrarium-encoded WebP tiles,
+z0–12, integer metres** and served from `<dataDir>/terrain/terrain.pmtiles`:
+
+- **Same privacy boundary as the vectors.** z0–10 is public XYZ; z11–12 only
+  leaves as the complete z10-anchored bundle (`privacy.MaxTerrainZoom = 12`,
+  compiled in like every other boundary). An archive deeper than z12 is refused
+  at import and at startup.
+- **Optional.** Without the archive every `/terrain` route answers 404 and the
+  app draws parkland flat (its "canopy" texture). A present-but-invalid archive
+  fails startup rather than silently looking absent.
+- **Integer metres, not terrain-RGB's 0.1 m.** The app quantizes elevation to
+  8-bit contour bands; the tenths are noise that defeats WebP. A hilly z12 tile
+  is ~15–30 KB, a full z0–12 bake on the order of 100 GB — size
+  `persistence.tiles.size` for it. All-sea tiles are not written (the app reads
+  a missing tile as 0 m).
+- **Bake** in-cluster with `tiles.terrainBake.enabled=true` (a suspended
+  CronJob; image `streetcryptid-terrain-bake`, built from `terrain/`). It reads
+  the public COGs in place over HTTPS and is **resumable**: progress lives in a
+  SQLite staging DB on its scratch volume, so a retried pod continues at the next
+  1-degree cell. The Job's last step is `tiles import-terrain`, which moves the
+  archive into place and recreates the pod. `--bbox` (`tiles.terrainBake.bbox`)
+  bakes a region; CI bakes one Kyoto cell and imports it with the Go server on
+  every PR.
+
+```bash
+kubectl create job maps-terrain-now --from=cronjob/maps-streetcryptid-map-server-terrain-bake
+# locally, against a regional bake:
+docker build -t terrain-bake terrain
+docker run --rm -v "$PWD/out:/work" terrain-bake --output /work/terrain.pmtiles \
+  --workdir /work/wd --bbox 135,34,137,36
+go run ./cmd/fixture-server -terrain out/terrain.pmtiles   # serves /terrain on 127.0.0.1:8089
+```
+
+Copernicus attribution (required by its licence): "© DLR e.V. 2010-2014 and
+© Airbus Defence and Space GmbH 2014-2018 provided under COPERNICUS by the
+European Union and ESA; all rights reserved".
+
 ## The binary
 
 One static, non-root, distroless image; four subcommands:
@@ -319,6 +362,7 @@ streetcryptid-map-server serve            # the public API
 streetcryptid-map-server tiles bootstrap  # init container
 streetcryptid-map-server tiles watch      # updater sidecar
 streetcryptid-map-server tiles verify     # verify the active local release
+streetcryptid-map-server tiles import-terrain <file> [version]  # install a terrain bake
 ```
 
 ## Build & test
@@ -378,5 +422,6 @@ internal/httpapi      routes, coarse + bundle handlers, health, metrics, limits
 internal/tilesync     signed manifest, resumable download, releases, updater, k8s patch
 helm/                 chart (API + private Martin + bootstrap + updater)
 scripts/              bake / publish / verify (workstation/CI)
+terrain/              Copernicus DEM → Terrarium WebP PMTiles bake (Python + GDAL image)
 scripts/bundle-stat.py  stage / tile / layer size report for SCB2 and SCB3 streams
 ```

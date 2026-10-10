@@ -97,6 +97,14 @@ func runServe(log *slog.Logger) error {
 	}
 	defer bundleSource.Close()
 
+	terrain, terrainReader, err := openTerrain(os.Getenv("TILE_DATA_DIR"), log)
+	if err != nil {
+		return err
+	}
+	if terrainReader != nil {
+		defer terrainReader.Close()
+	}
+
 	srv := httpapi.New(httpapi.Config{
 		MartinBaseURL:    martinURL,
 		MartinCatalogURL: catalogURL,
@@ -104,6 +112,7 @@ func runServe(log *slog.Logger) error {
 		DatasetVersion:   dataset.Version,
 		DatasetDigest:    strings.ToLower(dataset.SHA256),
 		BundleSource:     bundleSource,
+		Terrain:          terrain,
 		BundleBuilds:     int(envInt64("BUNDLE_MAX_BUILDS", 1)),
 		BundleWorkers:    int(envInt64("BUNDLE_WORKERS", 16)),
 		BundleTimeout:    envDuration("BUNDLE_REQUEST_TIMEOUT", 60*time.Second),
@@ -137,6 +146,31 @@ func runServe(log *slog.Logger) error {
 	}
 	log.Info("shutdown complete")
 	return nil
+}
+
+// openTerrain opens the optional terrain DEM. Absent is fine (the /terrain
+// routes answer 404 and the app draws flat parkland); present but invalid is
+// not, because silently dropping it would look exactly like "absent".
+func openTerrain(dataDir string, log *slog.Logger) (*httpapi.Terrain, *pmtiles.Reader, error) {
+	info, err := tilesync.ReadTerrain(dataDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	if info == nil {
+		log.Info("no terrain archive; /terrain disabled")
+		return nil, nil, nil
+	}
+	r, err := pmtiles.OpenRaster(info.Path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("terrain: %w", err)
+	}
+	log.Info("terrain archive", "version", info.Version, "maxZoom", info.MaxZoom, "type", info.ContentType)
+	return &httpapi.Terrain{
+		Source:      r,
+		ContentType: info.ContentType,
+		Version:     info.Version,
+		MaxZoom:     info.MaxZoom,
+	}, r, nil
 }
 
 // The bootstrap verifies the large artifact. Serve pins that exact release file
@@ -251,6 +285,34 @@ func runTiles(log *slog.Logger, args []string) error {
 		defer cancel()
 		if _, err := s.ImportLocal(ctx, path, importVersion); err != nil {
 			return fmt.Errorf("import: %w", err)
+		}
+		return nil
+
+	case "import-terrain":
+		// tiles import-terrain <pmtiles-path> [version] — install a baked
+		// terrain-RGB archive as the served DEM (the terrain bake's last step).
+		if len(args) < 2 {
+			return errors.New("usage: tiles import-terrain <pmtiles-path> [version]")
+		}
+		importVersion := ""
+		if len(args) >= 3 {
+			importVersion = args[2]
+		}
+		var kube *tilesync.KubeClient
+		if cfg.DeploymentName != "" {
+			if k, err := tilesync.InClusterKubeClient(); err == nil {
+				kube = k
+				if cfg.Namespace == "" {
+					cfg.Namespace = k.Namespace()
+				}
+			} else {
+				log.Warn("import-terrain: no in-cluster client; will not trigger pod recreate", "err", err.Error())
+			}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		if _, err := tilesync.NewSyncer(cfg, kube).ImportTerrain(ctx, args[1], importVersion); err != nil {
+			return fmt.Errorf("import-terrain: %w", err)
 		}
 		return nil
 
