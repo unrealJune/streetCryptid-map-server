@@ -1,0 +1,125 @@
+{{- if .Values.tiles.terrainBake.enabled }}
+{{- $b := .Values.tiles.terrainBake }}
+# Bakes the Copernicus GLO-30 DEM into terrain.pmtiles (Terrarium WebP, z0-12)
+# and installs it as the served /terrain archive. Suspended by default; run with
+#   kubectl create job {{ include "scms.fullname" . }}-terrain-now \
+#     --from=cronjob/{{ include "scms.fullname" . }}-terrain-bake
+# The bake is RESUMABLE: progress lives on the scratch volume, so a pod that
+# dies (or a Job that hits its deadline) picks up at the next 1-degree cell.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "scms.fullname" . }}-terrain-bake
+  labels:
+    {{- include "scms.labels" . | nindent 4 }}
+spec:
+  suspend: {{ $b.suspend }}
+  schedule: {{ $b.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      # Retries resume from the staging database rather than starting over.
+      backoffLimit: {{ $b.backoffLimit }}
+      activeDeadlineSeconds: {{ $b.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "scms.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: terrain-bake
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "scms.serviceAccountName" . }}
+          nodeSelector:
+            kubernetes.io/hostname: {{ $b.nodeName | quote }}
+          {{- with $b.priorityClassName }}
+          priorityClassName: {{ . }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          initContainers:
+            - name: bake
+              image: "{{ $b.image.repository }}:{{ default .Chart.AppVersion $b.image.tag }}"
+              imagePullPolicy: {{ $b.image.pullPolicy }}
+              args:
+                - "--output=/scratch/terrain.pmtiles"
+                - "--workdir=/scratch/work"
+                - "--max-zoom={{ $b.maxZoom }}"
+                - "--workers={{ $b.workers }}"
+                {{- if $b.bbox }}
+                - "--bbox={{ $b.bbox }}"
+                {{- end }}
+              env:
+                # GDAL's HTTP reads of the public COGs; the bake reads ~0.5 TB.
+                - name: GDAL_HTTP_MAX_RETRY
+                  value: "8"
+                - name: HOME
+                  value: /scratch
+              volumeMounts:
+                - name: scratch
+                  mountPath: /scratch
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                {{- toYaml $b.resources | nindent 16 }}
+          containers:
+            - name: import
+              image: {{ include "scms.apiImage" . }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              args:
+                - "tiles"
+                - "import-terrain"
+                - "/scratch/terrain.pmtiles"
+                {{- if $b.version }}
+                - {{ $b.version | quote }}
+                {{- end }}
+              env:
+                - name: TILE_DATA_DIR
+                  value: {{ .Values.tiles.dataDir | quote }}
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: DEPLOYMENT_NAME
+                  value: {{ include "scms.fullname" . | quote }}
+              volumeMounts:
+                - name: tiles
+                  mountPath: {{ .Values.tiles.dataDir }}
+                - name: scratch
+                  mountPath: /scratch
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              resources:
+                {{- toYaml $b.importResources | nindent 16 }}
+          volumes:
+            - name: tiles
+              persistentVolumeClaim:
+                claimName: {{ include "scms.tilesClaimName" . }}
+            - name: scratch
+              persistentVolumeClaim:
+                claimName: {{ include "scms.fullname" . }}-terrain-scratch
+---
+# The staging database (every baked tile, ~1.5x the output) and the output
+# before it is moved onto the tile volume. Kept across runs: it is the resume
+# point.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "scms.fullname" . }}-terrain-scratch
+  labels:
+    {{- include "scms.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ $b.scratch.size }}
+  {{- if $b.scratch.storageClass }}
+  storageClassName: {{ $b.scratch.storageClass | quote }}
+  {{- end }}
+{{- end }}

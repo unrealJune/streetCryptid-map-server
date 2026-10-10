@@ -19,6 +19,10 @@ const (
 	// MaxBundleZoom is the deepest data zoom obtainable through the bundle
 	// endpoint.
 	MaxBundleZoom = 14
+	// MaxTerrainZoom is the deepest terrain (DEM) zoom served at all. Terrain
+	// tiles above MaxPublicRawZoom leave only as z10-anchored bundles, exactly
+	// like the vector tiles: the same anchor, the same quantization.
+	MaxTerrainZoom = 12
 )
 
 // TileCoord is an XYZ tile address.
@@ -78,6 +82,15 @@ func ValidateBundle(x10, y10, tileZoom int) (BundleRequest, error) {
 		return BundleRequest{}, fmt.Errorf("bundle anchor out of range")
 	}
 	return BundleRequest{AnchorX: x10, AnchorY: y10, TileZoom: tileZoom}, nil
+}
+
+// ValidateTerrainBundle is ValidateBundle for the terrain archive: the same
+// fixed z10 anchor, with the data zoom bounded by MaxTerrainZoom.
+func ValidateTerrainBundle(x10, y10, tileZoom int) (BundleRequest, error) {
+	if tileZoom > MaxTerrainZoom {
+		return BundleRequest{}, fmt.Errorf("terrain bundle tile zoom %d out of range", tileZoom)
+	}
+	return ValidateBundle(x10, y10, tileZoom)
 }
 
 // Descendants returns every tile at the request's data zoom beneath the fixed

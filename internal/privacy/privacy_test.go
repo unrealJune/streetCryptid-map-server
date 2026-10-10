@@ -111,3 +111,19 @@ func TestNoConfigCanMoveBoundary(t *testing.T) {
 		t.Fatal("privacy constants changed; the app protocol assumes 10/10/14")
 	}
 }
+
+func TestTerrainBundleZoomBoundaries(t *testing.T) {
+	for _, z := range []int{10, 13, 14} {
+		if _, err := ValidateTerrainBundle(0, 0, z); err == nil {
+			t.Fatalf("terrain bundle tileZoom %d should be rejected", z)
+		}
+	}
+	for _, z := range []int{11, 12} {
+		if _, err := ValidateTerrainBundle(0, 0, z); err != nil {
+			t.Fatalf("terrain bundle tileZoom %d should be accepted: %v", z, err)
+		}
+	}
+	if _, err := ValidateTerrainBundle(1024, 0, 12); err == nil {
+		t.Fatal("terrain anchor out of range should be rejected")
+	}
+}
