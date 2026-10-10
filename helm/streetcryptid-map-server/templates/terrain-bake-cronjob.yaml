@@ -40,7 +40,8 @@ spec:
             {{- toYaml .Values.podSecurityContext | nindent 12 }}
           initContainers:
             - name: bake
-              image: "{{ $b.image.repository }}:{{ default .Chart.AppVersion $b.image.tag }}"
+              # release.yml cuts this image with the server's, at the same tag.
+              image: "{{ $b.image.repository }}:{{ $b.image.tag | default .Values.image.tag | default .Chart.AppVersion }}"
               imagePullPolicy: {{ $b.image.pullPolicy }}
               args:
                 - "--output=/scratch/terrain.pmtiles"

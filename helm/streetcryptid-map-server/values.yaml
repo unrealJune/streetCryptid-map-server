@@ -179,7 +179,7 @@ tiles:
     enabled: false
     image:
       repository: ghcr.io/unrealjune/streetcryptid-terrain-bake
-      tag: ""          # defaults to .Chart.AppVersion
+      tag: ""          # defaults to image.tag (same release), then .Chart.AppVersion
       pullPolicy: IfNotPresent
     suspend: true
     schedule: "0 4 1 1 *"   # yearly (only if suspend=false); the DEM rarely changes
