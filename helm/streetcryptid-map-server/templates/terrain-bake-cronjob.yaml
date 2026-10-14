@@ -103,7 +103,8 @@ spec:
               persistentVolumeClaim:
                 claimName: {{ include "scms.fullname" . }}-terrain-scratch
 ---
-# The staging database (every baked tile, ~1.5x the output) and the output
+# The staging database (every baked tile), the PMTiles writer's spool of every
+# tile (work/tmp) and the output
 # before it is moved onto the tile volume. Kept across runs: it is the resume
 # point.
 apiVersion: v1
