@@ -37,6 +37,7 @@ import multiprocessing as mp
 import os
 import sqlite3
 import sys
+import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -336,6 +337,11 @@ def main() -> int:
         p.error("--max-zoom must be 1..12 (the server refuses deeper terrain)")
     bbox = tuple(float(v) for v in args.bbox.split(",")) if args.bbox else None
     os.makedirs(args.workdir, exist_ok=True)
+    # The PMTiles Writer spools every tile to a tempfile.TemporaryFile before
+    # it writes the archive -- a planet's worth (~95 GB). Left to /tmp that is
+    # the node's root disk, which a 2026-10-14 bake filled toward eviction.
+    tempfile.tempdir = os.path.join(args.workdir, "tmp")
+    os.makedirs(tempfile.tempdir, exist_ok=True)
 
     # Remote COGs: never list directories, cache what we read, retry quietly.
     os.environ.setdefault("GDAL_DISABLE_READDIR_ON_OPEN", "EMPTY_DIR")

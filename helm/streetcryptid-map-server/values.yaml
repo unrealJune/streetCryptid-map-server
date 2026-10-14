@@ -199,7 +199,9 @@ tiles:
         cpu: "6"
         memory: 16Gi
     scratch:
-      size: 250Gi
+      # Staging DB (~105 GB for the planet) + the writer's spool of every tile
+      # (~95 GB) + the archive (~95 GB), all at once at the end.
+      size: 400Gi
       storageClass: longhorn-local
     importResources:
       requests:
