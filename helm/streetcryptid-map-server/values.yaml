@@ -116,10 +116,13 @@ tiles:
   # ReadWriteOnce tile volume with the bake pod.
   bake:
     enabled: false
-    # onthegomap/planetiler, pinned. Runs as the bake init container.
+    # Planetiler's OpenMapTiles profile with OSM land cover from z5 instead of
+    # z7 (planetiler/, built by CI). Runs as the bake init container and takes
+    # the same arguments as ghcr.io/onthegomap/planetiler, which still works
+    # here but bakes no forest, rock or farmland below z7.
     image:
-      repository: ghcr.io/onthegomap/planetiler
-      tag: "0.9.0"
+      repository: ghcr.io/unrealjune/streetcryptid-planetiler
+      tag: ""          # defaults to image.tag (same release), then .Chart.AppVersion
       pullPolicy: IfNotPresent
     # Planetiler --area (planet, or a region extract name / .osm.pbf URL).
     area: planet

@@ -312,6 +312,26 @@ helm upgrade --install maps helm/streetcryptid-map-server \
 kubectl create job maps-bake-now --from=cronjob/maps-streetcryptid-map-server-bake
 ```
 
+#### Land cover below z7
+
+The bake runs `streetcryptid-planetiler` (built from `planetiler/`), not stock
+Planetiler. It is the OpenMapTiles profile at a pinned commit with one patch
+(`planetiler/landcover-low-zoom.patch`): OSM `landcover` (wood, grass,
+farmland, wetland, sand, rock, ice) starts at **z5** instead of z7. Upstream
+carries only Natural Earth glaciers below z7, so the app, which fetches one zoom
+coarser than its camera, drew bare land up to camera z8 and then the whole
+forest at once. z5–6 are generalized the way upstream does z7 (features under
+2 px dropped, the rest merged), so they hold the larger forests and the finer
+patches arrive by z7.
+
+The image takes the same arguments as `ghcr.io/onthegomap/planetiler`, and the
+stock image still works in its place (it just bakes no land cover below z7). The
+change reaches the app only after a re-bake. CI bakes Luxembourg to z7 with the
+image and checks that z6 now carries forest and z4 still does not
+(`planetiler/check_landcover.py`). To move the pin, bump `OMT_COMMIT` to a planetiler-openmaptiles commit built against the
+Planetiler version you want, and check that the patch still applies and the
+landcover tests it rewrites still pass (the Docker build runs them).
+
 ### Terrain (the /terrain DEM)
 
 The app shades parkland from elevation — hillshade, dotted contours, a treeline.
