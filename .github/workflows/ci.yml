@@ -88,3 +88,33 @@ jobs:
           TILE_DATA_DIR="$RUNNER_TEMP/data" go run ./cmd/server tiles import-terrain \
             "$RUNNER_TEMP/bake/terrain.pmtiles" ci-smoke
           test -s "$RUNNER_TEMP/data/terrain/terrain.pmtiles"
+
+  # The planet bake image against a real (small) extract: proves the land cover
+  # patch still applies, builds, and puts OSM forest into z6 tiles, which the
+  # stock OpenMapTiles profile leaves empty below z7.
+  planetiler-bake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the bake image
+        run: docker build -t planetiler-bake planetiler
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/bake/sources
+          key: planetiler-sources-luxembourg-v1
+      - name: bake Luxembourg to z7
+        run: |
+          mkdir -p "$RUNNER_TEMP/bake/sources" "$RUNNER_TEMP/bake/tmp"
+          docker run --rm --user "$(id -u):$(id -g)" -e JAVA_TOOL_OPTIONS=-Xmx3g \
+            -v "$RUNNER_TEMP/bake:/work" planetiler-bake \
+            --download --area=luxembourg --maxzoom=7 --languages=en \
+            --download-dir=/work/sources --tmpdir=/work/tmp \
+            --force --output=/work/out.pmtiles
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: OSM land cover below z7, none at z4
+        run: |
+          pip install --quiet pmtiles mapbox-vector-tile
+          python planetiler/check_landcover.py "$RUNNER_TEMP/bake/out.pmtiles" \
+            --lat 49.85 --lon 6.0 --class wood

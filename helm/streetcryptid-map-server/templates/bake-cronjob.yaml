@@ -40,7 +40,7 @@ spec:
           # --- Heavy, throttled bake runs as an init container ---------------
           initContainers:
             - name: planetiler
-              image: "{{ $b.image.repository }}:{{ $b.image.tag }}"
+              image: "{{ $b.image.repository }}:{{ $b.image.tag | default .Values.image.tag | default .Chart.AppVersion }}"
               imagePullPolicy: {{ $b.image.pullPolicy }}
               env:
                 # Cap the JVM heap well under the memory limit; the rest is
